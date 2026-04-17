@@ -7,6 +7,7 @@ from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL
 app = FastAPI()
 
 usuarios = {}
+mensagens_processadas = set()
 
 
 # =====================================================
@@ -23,7 +24,7 @@ def enviar_mensagem(contact_id, texto):
 
     body = {
         "contactId": contact_id,
-        "type": "text",
+        "type": "chat",
         "text": texto
     }
 
@@ -75,7 +76,7 @@ def bling_get(endpoint, params=None, retry_on_401=True):
 
 
 def limpar_documento(doc):
-    return "".join(ch for ch in str(doc) if ch.isdigit())
+    return "".join(ch for ch in str(doc or "") if ch.isdigit())
 
 
 def buscar_boletos_por_cpf(cpf_cnpj):
@@ -88,7 +89,7 @@ def buscar_boletos_por_cpf(cpf_cnpj):
         params = {
             "pagina": pagina,
             "limite": 100,
-            "situacoes[]": [1, 3]   # aberto + atrasado
+            "situacoes[]": [1, 3]
         }
 
         resp = bling_get("/contas/receber", params=params)
@@ -96,7 +97,7 @@ def buscar_boletos_por_cpf(cpf_cnpj):
         print("Bling contas/receber:", resp.status_code)
 
         if resp.status_code != 200:
-            print("Erro Bling:", resp.text)
+            print("Erro Bling contas/receber:", resp.text)
             return []
 
         data = resp.json().get("data", [])
@@ -146,6 +147,9 @@ def buscar_link_boleto_por_conta(id_conta):
     payload = resp.json()
     data = payload.get("data", {})
 
+    if not isinstance(data, dict):
+        return None
+
     return (
         data.get("link")
         or data.get("url")
@@ -166,20 +170,36 @@ def home():
 @app.post("/webhook/digisac")
 async def webhook(request: Request):
     body = await request.json()
-
     print("Webhook recebido:", body)
 
     data = body.get("data", {})
 
+    message_id = data.get("id")
     contact_id = data.get("contactId")
     is_from_me = data.get("isFromMe", True)
-
+    message_type = data.get("type")
     mensagem_original = str(data.get("text", "")).strip()
     mensagem = mensagem_original.lower()
-
     comando = data.get("command") or mensagem_original
 
+    # evita processar a mesma mensagem mais de uma vez
+    if message_id in mensagens_processadas:
+        return {"status": "ok"}
+
+    if message_id:
+        mensagens_processadas.add(message_id)
+
+    if len(mensagens_processadas) > 5000:
+        mensagens_processadas.clear()
+
+    # só processa mensagem real de texto enviada pelo cliente
     if not contact_id or is_from_me:
+        return {"status": "ok"}
+
+    if message_type != "chat":
+        return {"status": "ok"}
+
+    if not mensagem_original:
         return {"status": "ok"}
 
     estado = usuarios.get(contact_id, {}).get("estado")
@@ -232,7 +252,6 @@ async def webhook(request: Request):
                 contact_id,
                 "Não encontrei boletos em aberto ou em atraso."
             )
-
             usuarios.pop(contact_id, None)
             return {"status": "ok"}
 
@@ -261,7 +280,6 @@ async def webhook(request: Request):
     # =====================================================
     if estado == "AGUARDANDO_PEDIDO":
         mapa = usuarios[contact_id]["mapa_pedidos"]
-
         pedido = mapa.get(mensagem)
 
         if not pedido:
@@ -318,8 +336,14 @@ async def webhook(request: Request):
 
         elif mensagem in mapa:
             boleto = mapa[mensagem]
-
             id_conta = boleto.get("id")
+
+            if not id_conta:
+                enviar_mensagem(
+                    contact_id,
+                    "Não encontrei o identificador do boleto."
+                )
+                return {"status": "ok"}
 
             link = buscar_link_boleto_por_conta(id_conta)
 
@@ -333,10 +357,7 @@ async def webhook(request: Request):
             enviar_documento(contact_id, link)
 
         else:
-            enviar_mensagem(
-                contact_id,
-                "Opção inválida."
-            )
+            enviar_mensagem(contact_id, "Opção inválida.")
             return {"status": "ok"}
 
         usuarios[contact_id]["estado"] = "FINALIZANDO"
@@ -352,28 +373,16 @@ async def webhook(request: Request):
     # FINALIZAÇÃO
     # =====================================================
     if estado == "FINALIZANDO":
-
         if mensagem == "1":
-            enviar_mensagem(
-                contact_id,
-                "Atendimento encerrado ✅"
-            )
-
+            enviar_mensagem(contact_id, "Atendimento encerrado ✅")
             usuarios.pop(contact_id, None)
 
         elif mensagem == "2":
-            enviar_mensagem(
-                contact_id,
-                "Vou transferir para o financeiro 👨‍💼"
-            )
-
+            enviar_mensagem(contact_id, "Vou transferir para o financeiro 👨‍💼")
             usuarios.pop(contact_id, None)
 
         else:
-            enviar_mensagem(
-                contact_id,
-                "Digite 1 ou 2."
-            )
+            enviar_mensagem(contact_id, "Digite 1 ou 2.")
 
         return {"status": "ok"}
 
