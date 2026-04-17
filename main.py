@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 import requests
+import time
 
 from auth_bling import obter_access_token, forcar_refresh
 from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL
@@ -67,10 +68,17 @@ def bling_get(endpoint, params=None, retry_on_401=True):
 
     resp = requests.get(url, headers=headers, params=params, timeout=30)
 
+    # token expirado
     if resp.status_code == 401 and retry_on_401:
         print("Token expirado. Renovando...")
         forcar_refresh()
         return bling_get(endpoint, params=params, retry_on_401=False)
+
+    # limite de requisição
+    if resp.status_code == 429:
+        print("Rate limit atingido. Aguardando 1s...")
+        time.sleep(1)
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
 
     return resp
 
@@ -79,9 +87,44 @@ def limpar_documento(doc):
     return "".join(ch for ch in str(doc or "") if ch.isdigit())
 
 
-def buscar_boletos_por_cpf(cpf_cnpj):
-    cpf_cnpj = limpar_documento(cpf_cnpj)
+# =====================================================
+# NOVA LÓGICA
+# =====================================================
 
+def buscar_contato_por_documento(cpf_cnpj):
+    pagina = 1
+
+    while True:
+        params = {
+            "pagina": pagina,
+            "limite": 100
+        }
+
+        resp = bling_get("/contatos", params=params)
+
+        print("Bling contatos:", resp.status_code)
+
+        if resp.status_code != 200:
+            return None
+
+        data = resp.json().get("data", [])
+
+        if not data:
+            return None
+
+        for contato in data:
+            doc = limpar_documento(contato.get("numeroDocumento", ""))
+
+            if doc == cpf_cnpj:
+                return contato
+
+        if len(data) < 100:
+            return None
+
+        pagina += 1
+
+
+def buscar_boletos_por_contato(contato_id):
     pagina = 1
     encontrados = []
 
@@ -89,7 +132,8 @@ def buscar_boletos_por_cpf(cpf_cnpj):
         params = {
             "pagina": pagina,
             "limite": 100,
-            "situacoes[]": [1, 3]
+            "situacoes[]": [1, 3],
+            "idContato": contato_id
         }
 
         resp = bling_get("/contas/receber", params=params)
@@ -97,20 +141,14 @@ def buscar_boletos_por_cpf(cpf_cnpj):
         print("Bling contas/receber:", resp.status_code)
 
         if resp.status_code != 200:
-            print("Erro Bling contas/receber:", resp.text)
-            return []
+            return encontrados
 
         data = resp.json().get("data", [])
 
         if not data:
             break
 
-        for item in data:
-            contato = item.get("contato", {}) or {}
-            doc = limpar_documento(contato.get("numeroDocumento", ""))
-
-            if doc == cpf_cnpj:
-                encontrados.append(item)
+        encontrados.extend(data)
 
         if len(data) < 100:
             break
@@ -139,7 +177,7 @@ def agrupar_boletos_por_pedido(lista):
 def buscar_link_boleto_por_conta(id_conta):
     resp = bling_get(f"/contas/receber/{id_conta}/boleto")
 
-    print(f"Bling boleto {id_conta}:", resp.status_code, resp.text)
+    print(f"Bling boleto {id_conta}:", resp.status_code)
 
     if resp.status_code != 200:
         return None
@@ -178,11 +216,13 @@ async def webhook(request: Request):
     contact_id = data.get("contactId")
     is_from_me = data.get("isFromMe", True)
     message_type = data.get("type")
+
     mensagem_original = str(data.get("text", "")).strip()
     mensagem = mensagem_original.lower()
+
     comando = data.get("command") or mensagem_original
 
-    # evita processar a mesma mensagem mais de uma vez
+    # evita duplicidade
     if message_id in mensagens_processadas:
         return {"status": "ok"}
 
@@ -192,7 +232,7 @@ async def webhook(request: Request):
     if len(mensagens_processadas) > 5000:
         mensagens_processadas.clear()
 
-    # só processa mensagem real de texto enviada pelo cliente
+    # filtros
     if not contact_id or is_from_me:
         return {"status": "ok"}
 
@@ -205,7 +245,7 @@ async def webhook(request: Request):
     estado = usuarios.get(contact_id, {}).get("estado")
 
     # =====================================================
-    # GATILHO TEMPORÁRIO DE TESTE
+    # TESTE
     # =====================================================
     if mensagem == "teste boleto":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
@@ -218,7 +258,7 @@ async def webhook(request: Request):
         return {"status": "ok"}
 
     # =====================================================
-    # FLUXO OFICIAL (BOTÃO)
+    # BOTÃO FUTURO
     # =====================================================
     if comando == "SEGUNDA_VIA":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
@@ -231,7 +271,7 @@ async def webhook(request: Request):
         return {"status": "ok"}
 
     # =====================================================
-    # CPF / CNPJ
+    # CPF
     # =====================================================
     if estado == "AGUARDANDO_CPF":
         cpf = limpar_documento(mensagem)
@@ -245,7 +285,17 @@ async def webhook(request: Request):
 
         enviar_mensagem(contact_id, "Buscando seus boletos... 🔍")
 
-        boletos = buscar_boletos_por_cpf(cpf)
+        contato = buscar_contato_por_documento(cpf)
+
+        if not contato:
+            enviar_mensagem(
+                contact_id,
+                "Cadastro não localizado."
+            )
+            usuarios.pop(contact_id, None)
+            return {"status": "ok"}
+
+        boletos = buscar_boletos_por_contato(contato["id"])
 
         if not boletos:
             enviar_mensagem(
@@ -276,10 +326,11 @@ async def webhook(request: Request):
         return {"status": "ok"}
 
     # =====================================================
-    # ESCOLHA PEDIDO
+    # PEDIDO
     # =====================================================
     if estado == "AGUARDANDO_PEDIDO":
         mapa = usuarios[contact_id]["mapa_pedidos"]
+
         pedido = mapa.get(mensagem)
 
         if not pedido:
@@ -307,7 +358,7 @@ async def webhook(request: Request):
         return {"status": "ok"}
 
     # =====================================================
-    # ESCOLHA BOLETO
+    # BOLETO
     # =====================================================
     if estado == "AGUARDANDO_BOLETO":
         mapa = usuarios[contact_id]["mapa_boletos"]
@@ -318,9 +369,6 @@ async def webhook(request: Request):
             for boleto in mapa.values():
                 id_conta = boleto.get("id")
 
-                if not id_conta:
-                    continue
-
                 link = buscar_link_boleto_por_conta(id_conta)
 
                 if link:
@@ -328,30 +376,17 @@ async def webhook(request: Request):
                     enviados += 1
 
             if enviados == 0:
-                enviar_mensagem(
-                    contact_id,
-                    "Não consegui obter os boletos."
-                )
+                enviar_mensagem(contact_id, "Não consegui obter boletos.")
                 return {"status": "ok"}
 
         elif mensagem in mapa:
             boleto = mapa[mensagem]
             id_conta = boleto.get("id")
 
-            if not id_conta:
-                enviar_mensagem(
-                    contact_id,
-                    "Não encontrei o identificador do boleto."
-                )
-                return {"status": "ok"}
-
             link = buscar_link_boleto_por_conta(id_conta)
 
             if not link:
-                enviar_mensagem(
-                    contact_id,
-                    "Não consegui obter esse boleto."
-                )
+                enviar_mensagem(contact_id, "Não consegui obter esse boleto.")
                 return {"status": "ok"}
 
             enviar_documento(contact_id, link)
@@ -370,7 +405,7 @@ async def webhook(request: Request):
         return {"status": "ok"}
 
     # =====================================================
-    # FINALIZAÇÃO
+    # FINAL
     # =====================================================
     if estado == "FINALIZANDO":
         if mensagem == "1":
