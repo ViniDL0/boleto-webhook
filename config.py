@@ -14,3 +14,4 @@ BLING_BASE_URL = "https://api.bling.com.br/Api/v3"
 TOKEN_URL = "https://api.bling.com.br/Api/v3/oauth/token"
 
 DIGISAC_TOKEN = os.getenv("DIGISAC_TOKEN")
+DIGISAC_BASE_URL = os.getenv("DIGISAC_BASE_URL")

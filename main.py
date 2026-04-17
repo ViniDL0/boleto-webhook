@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 import requests
 
 from auth_bling import obter_access_token, forcar_refresh
-from config import DIGISAC_TOKEN, BLING_BASE_URL
+from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL
 
 app = FastAPI()
 
@@ -14,7 +14,7 @@ usuarios = {}
 # =====================================================
 
 def enviar_mensagem(contact_id, texto):
-    url = "https://api.digisac.co/v1/messages"
+    url = f"{DIGISAC_BASE_URL}/messages"
 
     headers = {
         "Authorization": f"Bearer {DIGISAC_TOKEN}",
@@ -32,7 +32,7 @@ def enviar_mensagem(contact_id, texto):
 
 
 def enviar_documento(contact_id, url_pdf):
-    url = "https://api.digisac.co/v1/messages"
+    url = f"{DIGISAC_BASE_URL}/messages"
 
     headers = {
         "Authorization": f"Bearer {DIGISAC_TOKEN}",
