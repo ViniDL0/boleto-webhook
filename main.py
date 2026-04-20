@@ -265,70 +265,72 @@ def buscar_contato_por_documento(cpf_cnpj):
 # BUSCA BOLETOS
 # =====================================================
 
-def buscar_boletos_por_contato(contato_id):
-    if contato_id in cache_boletos_por_contato:
-        return {
-            "ok": True,
-            "boletos": cache_boletos_por_contato[contato_id]
-        }
+async def buscar_boletos_por_contato(contato_id):
+    token = await get_token()
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json"
+    }
 
     pagina = 1
-    encontrados = []
+    contas = []
 
-    while pagina <= 10:
-        params = {
-            "pagina": pagina,
-            "limite": 100,
-            "idContato": contato_id
-        }
+    async with httpx.AsyncClient(timeout=40) as client:
 
-        resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber:", resp.status_code, "pagina", pagina)
+        while True:
+            url = f"{BLING_BASE_URL}/contas/receber"
 
-        if resp.status_code != 200:
-            print("Erro contas:", resp.text)
-            return {"ok": False, "erro": "falha_consulta"}
+            params = {
+                "pagina": pagina,
+                "limite": 100,
+                "idContato": contato_id
+            }
 
-        data = resp.json().get("data", [])
+            resp = await client.get(url, headers=headers, params=params)
 
-        if not data:
-            break
+            print(f"Bling contas/receber: {resp.status_code} pagina {pagina}")
 
-        encontrados.extend(data)
+            if resp.status_code != 200:
+                return {"ok": False, "motivo": "erro api"}
 
-        if len(data) < 100:
-            break
+            dados = resp.json().get("data", [])
 
-        pagina += 1
+            if not dados:
+                break
 
-    # filtra só boleto em aberto / relevante
-    filtrados = []
+            contas.extend(dados)
 
-    for conta in encontrados:
-        detalhe = buscar_detalhe_conta(conta.get("id"))
-        print(
-            "FILTRO_CONTA:",
-            conta.get("id"),
-            "situacao=", conta.get("situacao"),
-            "origem=", (conta.get("origem") or {}).get("numero"),
-            "historico=", (detalhe or {}).get("historico", ""),
-            "forma=", ((conta.get("formaPagamento") or {}).get("descricao", ""))
-        )
+            if len(dados) < 100:
+                break
 
-        if conta_esta_paga(conta, detalhe):
-            continue
+            pagina += 1
 
-        if not conta_e_boleto(conta, detalhe):
-            continue
+    print("TOTAL_CONTAS:", len(contas))
 
-        conta["_detalhe"] = detalhe
-        conta["_pedido_numero"] = extrair_numero_pedido(conta, detalhe)
-        filtrados.append(conta)
+    boletos = []
 
-    cache_boletos_por_contato[contato_id] = filtrados
+    async with httpx.AsyncClient(timeout=40) as client:
 
-    return {"ok": True, "boletos": filtrados}
+        for conta in contas:
+            detalhe = await buscar_detalhe_conta(client, conta["id"])
 
+            print(
+                "FILTRO_CONTA:",
+                conta.get("id"),
+                "origem=", (conta.get("origem") or {}).get("numero"),
+                "historico=", (detalhe or {}).get("historico", "")
+            )
+
+            if conta_esta_paga(conta, detalhe):
+                continue
+
+            if not conta_e_boleto(conta, detalhe):
+                continue
+
+            boletos.append(conta)
+
+    return {"ok": True, "boletos": boletos}
 
 def agrupar_boletos_por_pedido(lista):
     pedidos = {}
