@@ -149,11 +149,6 @@ def buscar_detalhe_conta(id_conta):
 # =====================================================
 
 def conta_esta_paga(conta, detalhe):
-    situacao = conta.get("situacao")
-    # pelo seu log/screenshot, situacao 2 aparenta ser recebida
-    if situacao == 2:
-        return True
-
     historico = str((detalhe or {}).get("historico", "")).lower()
 
     termos_pago = [
@@ -316,7 +311,8 @@ def buscar_boletos_por_contato(contato_id):
             conta.get("id"),
             "situacao=", conta.get("situacao"),
             "origem=", (conta.get("origem") or {}).get("numero"),
-            "historico=", (detalhe or {}).get("historico", "")
+            "historico=", (detalhe or {}).get("historico", ""),
+            "forma=", ((conta.get("formaPagamento") or {}).get("descricao", ""))
         )
 
         if conta_esta_paga(conta, detalhe):
