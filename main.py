@@ -265,70 +265,67 @@ def buscar_contato_por_documento(cpf_cnpj):
 # BUSCA BOLETOS
 # =====================================================
 
-async def buscar_boletos_por_contato(contato_id):
-    token = await get_token()
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json"
-    }
+def buscar_boletos_por_contato(contato_id):
+    if contato_id in cache_boletos_por_contato:
+        return {
+            "ok": True,
+            "boletos": cache_boletos_por_contato[contato_id]
+        }
 
     pagina = 1
     contas = []
 
-    async with httpx.AsyncClient(timeout=40) as client:
+    while pagina <= 10:
+        params = {
+            "pagina": pagina,
+            "limite": 100,
+            "idContato": contato_id
+        }
 
-        while True:
-            url = f"{BLING_BASE_URL}/contas/receber"
+        resp = bling_get("/contas/receber", params=params)
+        print("Bling contas/receber:", resp.status_code, "pagina", pagina)
 
-            params = {
-                "pagina": pagina,
-                "limite": 100,
-                "idContato": contato_id
-            }
+        if resp.status_code != 200:
+            print("Erro contas:", resp.text)
+            return {"ok": False, "erro": "falha_consulta"}
 
-            resp = await client.get(url, headers=headers, params=params)
+        dados = resp.json().get("data", [])
 
-            print(f"Bling contas/receber: {resp.status_code} pagina {pagina}")
+        if not dados:
+            break
 
-            if resp.status_code != 200:
-                return {"ok": False, "motivo": "erro api"}
+        contas.extend(dados)
 
-            dados = resp.json().get("data", [])
+        if len(dados) < 100:
+            break
 
-            if not dados:
-                break
-
-            contas.extend(dados)
-
-            if len(dados) < 100:
-                break
-
-            pagina += 1
-
-    print("TOTAL_CONTAS:", len(contas))
+        pagina += 1
 
     boletos = []
 
-    async with httpx.AsyncClient(timeout=40) as client:
+    for conta in contas:
+        detalhe = buscar_detalhe_conta(conta.get("id"))
 
-        for conta in contas:
-            detalhe = await buscar_detalhe_conta(client, conta["id"])
+        print(
+            "FILTRO_CONTA:",
+            conta.get("id"),
+            "situacao=", conta.get("situacao"),
+            "origem=", (conta.get("origem") or {}).get("numero"),
+            "historico=", (detalhe or {}).get("historico", ""),
+            "forma=", ((conta.get("formaPagamento") or {}).get("descricao", ""))
+        )
 
-            print(
-                "FILTRO_CONTA:",
-                conta.get("id"),
-                "origem=", (conta.get("origem") or {}).get("numero"),
-                "historico=", (detalhe or {}).get("historico", "")
-            )
+        if conta_esta_paga(conta, detalhe):
+            continue
 
-            if conta_esta_paga(conta, detalhe):
-                continue
+        if not conta_e_boleto(conta, detalhe):
+            continue
 
-            if not conta_e_boleto(conta, detalhe):
-                continue
+        conta["_detalhe"] = detalhe
+        conta["_pedido_numero"] = extrair_numero_pedido(conta, detalhe)
+        boletos.append(conta)
 
-            boletos.append(conta)
+    cache_boletos_por_contato[contato_id] = boletos
 
     return {"ok": True, "boletos": boletos}
 
