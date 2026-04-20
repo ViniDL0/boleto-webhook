@@ -136,12 +136,18 @@ def buscar_contato_por_documento(cpf_cnpj):
     cpf_cnpj = limpar_documento(cpf_cnpj)
 
     if cpf_cnpj in cache_contatos_por_doc:
-        return {"ok": True, "contato": cache_contatos_por_doc[cpf_cnpj]}
+        return {
+            "ok": True,
+            "contato": cache_contatos_por_doc[cpf_cnpj],
+            "motivo": "cache"
+        }
 
     pagina = 1
-    max_paginas = 20
+    max_paginas = 220
 
     while pagina <= max_paginas:
+        print("BUSCANDO_CONTATO_PAGINA:", pagina)
+
         params = {
             "pagina": pagina,
             "limite": 100
@@ -160,7 +166,7 @@ def buscar_contato_por_documento(cpf_cnpj):
             print("AMOSTRA_CONTATO_1:", data[0])
 
         if not data:
-            return {"ok": True, "contato": None}
+            return {"ok": True, "contato": None, "motivo": "nao_encontrado"}
 
         for contato in data:
             doc = limpar_documento(contato.get("numeroDocumento", ""))
@@ -174,14 +180,14 @@ def buscar_contato_por_documento(cpf_cnpj):
 
             if doc == cpf_cnpj:
                 cache_contatos_por_doc[cpf_cnpj] = contato
-                return {"ok": True, "contato": contato}
+                return {"ok": True, "contato": contato, "motivo": "encontrado"}
 
         if len(data) < 100:
-            return {"ok": True, "contato": None}
+            return {"ok": True, "contato": None, "motivo": "nao_encontrado"}
 
         pagina += 1
 
-    return {"ok": False, "erro": "muitas_paginas"}
+    return {"ok": True, "contato": None, "motivo": "limite_paginas"}
 
 
 # =====================================================
@@ -313,33 +319,25 @@ async def webhook(request: Request):
 
     estado = usuarios.get(contact_id, {}).get("estado")
 
-    # =====================================================
-    # GATILHO DE TESTE
-    # =====================================================
+    # teste por texto
     if mensagem == "teste boleto":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
-
         enviar_mensagem(
             contact_id,
             "Digite seu CPF ou CNPJ para localizar seus boletos."
         )
         return {"status": "ok"}
 
-    # =====================================================
-    # FLUXO OFICIAL (BOTÃO)
-    # =====================================================
+    # fluxo oficial futuro por botão
     if comando == "SEGUNDA_VIA":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
-
         enviar_mensagem(
             contact_id,
             "Digite seu CPF ou CNPJ para localizar seus boletos."
         )
         return {"status": "ok"}
 
-    # =====================================================
-    # CPF / CNPJ
-    # =====================================================
+    # etapa cpf/cnpj
     if estado == "AGUARDANDO_CPF":
         cpf = limpar_documento(mensagem)
 
@@ -350,6 +348,8 @@ async def webhook(request: Request):
         enviar_mensagem(contact_id, "Buscando seus boletos... 🔍")
 
         resp_contato = buscar_contato_por_documento(cpf)
+
+        print("RESPOSTA_CONTATO_DEBUG:", resp_contato)
 
         if not resp_contato["ok"]:
             enviar_mensagem(
@@ -362,7 +362,10 @@ async def webhook(request: Request):
         contato = resp_contato["contato"]
 
         if not contato:
-            enviar_mensagem(contact_id, "Cadastro não localizado.")
+            enviar_mensagem(
+                contact_id,
+                "Cadastro não localizado para esse CPF/CNPJ."
+            )
             usuarios.pop(contact_id, None)
             return {"status": "ok"}
 
@@ -411,9 +414,7 @@ async def webhook(request: Request):
         enviar_mensagem(contact_id, texto)
         return {"status": "ok"}
 
-    # =====================================================
-    # ESCOLHA DO PEDIDO
-    # =====================================================
+    # etapa escolha do pedido
     if estado == "AGUARDANDO_PEDIDO":
         mapa = usuarios[contact_id]["mapa_pedidos"]
         pedido = mapa.get(mensagem)
@@ -442,9 +443,7 @@ async def webhook(request: Request):
         enviar_mensagem(contact_id, texto)
         return {"status": "ok"}
 
-    # =====================================================
-    # ESCOLHA DO BOLETO
-    # =====================================================
+    # etapa escolha do boleto
     if estado == "AGUARDANDO_BOLETO":
         mapa = usuarios[contact_id]["mapa_boletos"]
 
@@ -494,9 +493,7 @@ async def webhook(request: Request):
         )
         return {"status": "ok"}
 
-    # =====================================================
-    # FINALIZAÇÃO
-    # =====================================================
+    # finalização
     if estado == "FINALIZANDO":
         if mensagem == "1":
             enviar_mensagem(contact_id, "Atendimento encerrado ✅")
