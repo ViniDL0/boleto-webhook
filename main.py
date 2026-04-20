@@ -12,6 +12,7 @@ mensagens_processadas = set()
 
 cache_contatos_por_doc = {}
 cache_boletos_por_contato = {}
+cache_detalhe_conta = {}
 
 ULTIMA_CHAMADA_BLING = 0.0
 INTERVALO_MINIMO_BLING = 0.4
@@ -128,6 +129,93 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2):
     return resp
 
 
+def buscar_detalhe_conta(id_conta):
+    if id_conta in cache_detalhe_conta:
+        return cache_detalhe_conta[id_conta]
+
+    resp = bling_get(f"/contas/receber/{id_conta}")
+    print("DETALHE_CONTA_STATUS:", id_conta, resp.status_code)
+
+    if resp.status_code != 200:
+        return None
+
+    data = resp.json().get("data", {})
+    cache_detalhe_conta[id_conta] = data
+    return data
+
+
+# =====================================================
+# REGRAS DE FILTRO
+# =====================================================
+
+def conta_esta_paga(conta, detalhe):
+    situacao = conta.get("situacao")
+    # pelo seu log/screenshot, situacao 2 aparenta ser recebida
+    if situacao == 2:
+        return True
+
+    historico = str((detalhe or {}).get("historico", "")).lower()
+
+    termos_pago = [
+        "baixa de conta",
+        "recebida",
+        "recebido",
+        "pix santander em",
+        "rede",
+        "maxipago"
+    ]
+
+    return any(t in historico for t in termos_pago)
+
+
+def conta_e_boleto(conta, detalhe):
+    historico = str((detalhe or {}).get("historico", "")).lower()
+    forma = str(((conta.get("formaPagamento") or {}).get("descricao", ""))).lower()
+    link_boleto = str(conta.get("linkBoleto", "") or "").strip()
+
+    if "boleto" in historico:
+        return True
+
+    if "boleto" in forma:
+        return True
+
+    if link_boleto:
+        return True
+
+    return False
+
+
+def extrair_numero_pedido(conta, detalhe):
+    origem = conta.get("origem", {}) or {}
+    numero_origem = origem.get("numero")
+    if numero_origem:
+        return str(numero_origem).strip()
+
+    historico = str((detalhe or {}).get("historico", ""))
+
+    marcador = "pedido de venda nº"
+    texto = historico.lower()
+    if marcador in texto:
+        try:
+            parte = texto.split(marcador, 1)[1].strip()
+            numero = ""
+            for ch in parte:
+                if ch.isdigit():
+                    numero += ch
+                else:
+                    break
+            if numero:
+                return numero
+        except Exception:
+            pass
+
+    numero_doc = conta.get("numeroDocumento")
+    if numero_doc:
+        return str(numero_doc).strip()
+
+    return "Sem pedido"
+
+
 # =====================================================
 # BUSCA CONTATO
 # =====================================================
@@ -146,15 +234,13 @@ def buscar_contato_por_documento(cpf_cnpj):
     max_paginas = 220
 
     while pagina <= max_paginas:
-        print("BUSCANDO_CONTATO_PAGINA:", pagina)
-
         params = {
             "pagina": pagina,
             "limite": 100
         }
 
         resp = bling_get("/contatos", params=params)
-        print("Bling contatos:", resp.status_code)
+        print("Bling contatos:", resp.status_code, "pagina", pagina)
 
         if resp.status_code != 200:
             print("Erro contatos:", resp.text)
@@ -162,21 +248,11 @@ def buscar_contato_por_documento(cpf_cnpj):
 
         data = resp.json().get("data", [])
 
-        if pagina == 1 and data:
-            print("AMOSTRA_CONTATO_1:", data[0])
-
         if not data:
             return {"ok": True, "contato": None, "motivo": "nao_encontrado"}
 
         for contato in data:
             doc = limpar_documento(contato.get("numeroDocumento", ""))
-
-            print(
-                "CONTATO_DOC_DEBUG:",
-                contato.get("id"),
-                contato.get("nome"),
-                doc
-            )
 
             if doc == cpf_cnpj:
                 cache_contatos_por_doc[cpf_cnpj] = contato
@@ -212,15 +288,13 @@ def buscar_boletos_por_contato(contato_id):
         }
 
         resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber:", resp.status_code)
+        print("Bling contas/receber:", resp.status_code, "pagina", pagina)
 
         if resp.status_code != 200:
             print("Erro contas:", resp.text)
             return {"ok": False, "erro": "falha_consulta"}
 
         data = resp.json().get("data", [])
-
-        print("CONTAS_RECEBER_RAW:", data[:5])
 
         if not data:
             break
@@ -232,22 +306,39 @@ def buscar_boletos_por_contato(contato_id):
 
         pagina += 1
 
-    cache_boletos_por_contato[contato_id] = encontrados
+    # filtra só boleto em aberto / relevante
+    filtrados = []
 
-    return {"ok": True, "boletos": encontrados}
+    for conta in encontrados:
+        detalhe = buscar_detalhe_conta(conta.get("id"))
+        print(
+            "FILTRO_CONTA:",
+            conta.get("id"),
+            "situacao=", conta.get("situacao"),
+            "origem=", (conta.get("origem") or {}).get("numero"),
+            "historico=", (detalhe or {}).get("historico", "")
+        )
+
+        if conta_esta_paga(conta, detalhe):
+            continue
+
+        if not conta_e_boleto(conta, detalhe):
+            continue
+
+        conta["_detalhe"] = detalhe
+        conta["_pedido_numero"] = extrair_numero_pedido(conta, detalhe)
+        filtrados.append(conta)
+
+    cache_boletos_por_contato[contato_id] = filtrados
+
+    return {"ok": True, "boletos": filtrados}
 
 
 def agrupar_boletos_por_pedido(lista):
     pedidos = {}
 
     for b in lista:
-        numero = str(b.get("numeroDocumento", "Sem pedido")).strip()
-
-        if "/" in numero:
-            pedido = numero.split("/")[0].strip()
-        else:
-            pedido = numero or "Sem pedido"
-
+        pedido = str(b.get("_pedido_numero") or "Sem pedido").strip()
         pedidos.setdefault(pedido, []).append(b)
 
     return pedidos
@@ -318,7 +409,6 @@ async def webhook(request: Request):
 
     estado = usuarios.get(contact_id, {}).get("estado")
 
-    # teste por texto
     if mensagem == "teste boleto":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
         enviar_mensagem(
@@ -327,7 +417,6 @@ async def webhook(request: Request):
         )
         return {"status": "ok"}
 
-    # fluxo oficial futuro por botão
     if comando == "SEGUNDA_VIA":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
         enviar_mensagem(
@@ -336,7 +425,6 @@ async def webhook(request: Request):
         )
         return {"status": "ok"}
 
-    # etapa cpf/cnpj
     if estado == "AGUARDANDO_CPF":
         cpf = limpar_documento(mensagem)
 
@@ -387,7 +475,7 @@ async def webhook(request: Request):
         if not boletos:
             enviar_mensagem(
                 contact_id,
-                "Não encontrei boletos em aberto, em atraso ou a vencer para esse cadastro."
+                "Não encontrei boletos em aberto ou em atraso para esse cadastro."
             )
             usuarios.pop(contact_id, None)
             return {"status": "ok"}
@@ -412,7 +500,6 @@ async def webhook(request: Request):
         enviar_mensagem(contact_id, texto)
         return {"status": "ok"}
 
-    # etapa escolha do pedido
     if estado == "AGUARDANDO_PEDIDO":
         mapa = usuarios[contact_id]["mapa_pedidos"]
         pedido = mapa.get(mensagem)
@@ -429,7 +516,7 @@ async def webhook(request: Request):
         for i, b in enumerate(boletos, start=1):
             valor = formatar_valor(b.get("valor", 0))
             venc = b.get("vencimento") or b.get("dataVencimento") or "-"
-            situacao = b.get("situacao", b.get("situacaoId", "-"))
+            situacao = b.get("situacao", "-")
 
             texto += f"{i}️⃣ R$ {valor} - vence {venc} - situação {situacao}\n"
             mapa_boletos[str(i)] = b
@@ -442,7 +529,6 @@ async def webhook(request: Request):
         enviar_mensagem(contact_id, texto)
         return {"status": "ok"}
 
-    # etapa escolha do boleto
     if estado == "AGUARDANDO_BOLETO":
         mapa = usuarios[contact_id]["mapa_boletos"]
 
@@ -492,7 +578,6 @@ async def webhook(request: Request):
         )
         return {"status": "ok"}
 
-    # finalização
     if estado == "FINALIZANDO":
         if mensagem == "1":
             enviar_mensagem(contact_id, "Atendimento encerrado ✅")
