@@ -208,7 +208,6 @@ def buscar_boletos_por_contato(contato_id):
         params = {
             "pagina": pagina,
             "limite": 100,
-            "situacoes[]": [1, 3],
             "idContato": contato_id
         }
 
@@ -348,7 +347,6 @@ async def webhook(request: Request):
         enviar_mensagem(contact_id, "Buscando seus boletos... 🔍")
 
         resp_contato = buscar_contato_por_documento(cpf)
-
         print("RESPOSTA_CONTATO_DEBUG:", resp_contato)
 
         if not resp_contato["ok"]:
@@ -389,7 +387,7 @@ async def webhook(request: Request):
         if not boletos:
             enviar_mensagem(
                 contact_id,
-                "Não encontrei boletos em aberto ou em atraso."
+                "Não encontrei boletos em aberto, em atraso ou a vencer para esse cadastro."
             )
             usuarios.pop(contact_id, None)
             return {"status": "ok"}
@@ -431,8 +429,9 @@ async def webhook(request: Request):
         for i, b in enumerate(boletos, start=1):
             valor = formatar_valor(b.get("valor", 0))
             venc = b.get("vencimento") or b.get("dataVencimento") or "-"
+            situacao = b.get("situacao", b.get("situacaoId", "-"))
 
-            texto += f"{i}️⃣ R$ {valor} - vence {venc}\n"
+            texto += f"{i}️⃣ R$ {valor} - vence {venc} - situação {situacao}\n"
             mapa_boletos[str(i)] = b
 
         texto += "\nDigite o número ou TODOS."
