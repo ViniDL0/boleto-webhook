@@ -28,7 +28,7 @@ def limpar_documento(doc):
 def formatar_valor(valor):
     try:
         return f"{float(valor):.2f}".replace(".", ",")
-    except:
+    except Exception:
         return str(valor)
 
 
@@ -64,6 +64,7 @@ def enviar_mensagem(contact_id, texto):
 
     resp = requests.post(url, json=body, headers=headers, timeout=30)
     print("Digisac mensagem:", resp.status_code, resp.text)
+    return resp
 
 
 def enviar_documento(contact_id, url_pdf):
@@ -84,6 +85,7 @@ def enviar_documento(contact_id, url_pdf):
 
     resp = requests.post(url, json=body, headers=headers, timeout=30)
     print("Digisac documento:", resp.status_code, resp.text)
+    return resp
 
 
 # =====================================================
@@ -127,7 +129,7 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2):
 
 
 # =====================================================
-# BUSCA CONTATO (DEBUG)
+# BUSCA CONTATO
 # =====================================================
 
 def buscar_contato_por_documento(cpf_cnpj):
@@ -146,7 +148,6 @@ def buscar_contato_por_documento(cpf_cnpj):
         }
 
         resp = bling_get("/contatos", params=params)
-
         print("Bling contatos:", resp.status_code)
 
         if resp.status_code != 200:
@@ -155,7 +156,6 @@ def buscar_contato_por_documento(cpf_cnpj):
 
         data = resp.json().get("data", [])
 
-        # DEBUG amostra da primeira página
         if pagina == 1 and data:
             print("AMOSTRA_CONTATO_1:", data[0])
 
@@ -165,7 +165,6 @@ def buscar_contato_por_documento(cpf_cnpj):
         for contato in data:
             doc = limpar_documento(contato.get("numeroDocumento", ""))
 
-            # DEBUG
             print(
                 "CONTATO_DOC_DEBUG:",
                 contato.get("id"),
@@ -208,7 +207,6 @@ def buscar_boletos_por_contato(contato_id):
         }
 
         resp = bling_get("/contas/receber", params=params)
-
         print("Bling contas/receber:", resp.status_code)
 
         if resp.status_code != 200:
@@ -216,6 +214,8 @@ def buscar_boletos_por_contato(contato_id):
             return {"ok": False, "erro": "falha_consulta"}
 
         data = resp.json().get("data", [])
+
+        print("CONTAS_RECEBER_RAW:", data[:5])
 
         if not data:
             break
@@ -236,12 +236,12 @@ def agrupar_boletos_por_pedido(lista):
     pedidos = {}
 
     for b in lista:
-        numero = str(b.get("numeroDocumento", "Sem pedido"))
+        numero = str(b.get("numeroDocumento", "Sem pedido")).strip()
 
         if "/" in numero:
             pedido = numero.split("/")[0].strip()
         else:
-            pedido = numero.strip()
+            pedido = numero or "Sem pedido"
 
         pedidos.setdefault(pedido, []).append(b)
 
@@ -250,13 +250,15 @@ def agrupar_boletos_por_pedido(lista):
 
 def buscar_link_boleto_por_conta(id_conta):
     resp = bling_get(f"/contas/receber/{id_conta}/boleto")
-
-    print("Bling boleto:", resp.status_code, id_conta)
+    print("Bling boleto:", resp.status_code, id_conta, resp.text)
 
     if resp.status_code != 200:
         return None
 
     data = resp.json().get("data", {})
+
+    if not isinstance(data, dict):
+        return None
 
     return (
         data.get("link")
@@ -312,7 +314,7 @@ async def webhook(request: Request):
     estado = usuarios.get(contact_id, {}).get("estado")
 
     # =====================================================
-    # TESTE
+    # GATILHO DE TESTE
     # =====================================================
     if mensagem == "teste boleto":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
@@ -321,20 +323,28 @@ async def webhook(request: Request):
             contact_id,
             "Digite seu CPF ou CNPJ para localizar seus boletos."
         )
-
         return {"status": "ok"}
 
     # =====================================================
-    # CPF
+    # FLUXO OFICIAL (BOTÃO)
+    # =====================================================
+    if comando == "SEGUNDA_VIA":
+        usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
+
+        enviar_mensagem(
+            contact_id,
+            "Digite seu CPF ou CNPJ para localizar seus boletos."
+        )
+        return {"status": "ok"}
+
+    # =====================================================
+    # CPF / CNPJ
     # =====================================================
     if estado == "AGUARDANDO_CPF":
         cpf = limpar_documento(mensagem)
 
         if len(cpf) not in (11, 14):
-            enviar_mensagem(
-                contact_id,
-                "CPF ou CNPJ inválido."
-            )
+            enviar_mensagem(contact_id, "CPF ou CNPJ inválido.")
             return {"status": "ok"}
 
         enviar_mensagem(contact_id, "Buscando seus boletos... 🔍")
@@ -356,13 +366,18 @@ async def webhook(request: Request):
             usuarios.pop(contact_id, None)
             return {"status": "ok"}
 
+        print(
+            "CONTATO_ENCONTRADO_ID:",
+            contato.get("id"),
+            contato.get("nome"),
+            contato.get("numeroDocumento")
+        )
+
         resp_boletos = buscar_boletos_por_contato(contato["id"])
+        print("RESPOSTA_BOLETOS_DEBUG:", resp_boletos)
 
         if not resp_boletos["ok"]:
-            enviar_mensagem(
-                contact_id,
-                "Erro ao consultar boletos."
-            )
+            enviar_mensagem(contact_id, "Erro ao consultar boletos.")
             usuarios.pop(contact_id, None)
             return {"status": "ok"}
 
@@ -394,6 +409,106 @@ async def webhook(request: Request):
         }
 
         enviar_mensagem(contact_id, texto)
+        return {"status": "ok"}
+
+    # =====================================================
+    # ESCOLHA DO PEDIDO
+    # =====================================================
+    if estado == "AGUARDANDO_PEDIDO":
+        mapa = usuarios[contact_id]["mapa_pedidos"]
+        pedido = mapa.get(mensagem)
+
+        if not pedido:
+            enviar_mensagem(contact_id, "Opção inválida.")
+            return {"status": "ok"}
+
+        boletos = usuarios[contact_id]["pedidos"][pedido]
+
+        texto = "Boletos disponíveis:\n\n"
+        mapa_boletos = {}
+
+        for i, b in enumerate(boletos, start=1):
+            valor = formatar_valor(b.get("valor", 0))
+            venc = b.get("vencimento") or b.get("dataVencimento") or "-"
+
+            texto += f"{i}️⃣ R$ {valor} - vence {venc}\n"
+            mapa_boletos[str(i)] = b
+
+        texto += "\nDigite o número ou TODOS."
+
+        usuarios[contact_id]["estado"] = "AGUARDANDO_BOLETO"
+        usuarios[contact_id]["mapa_boletos"] = mapa_boletos
+
+        enviar_mensagem(contact_id, texto)
+        return {"status": "ok"}
+
+    # =====================================================
+    # ESCOLHA DO BOLETO
+    # =====================================================
+    if estado == "AGUARDANDO_BOLETO":
+        mapa = usuarios[contact_id]["mapa_boletos"]
+
+        if mensagem == "todos":
+            enviados = 0
+
+            for boleto in mapa.values():
+                id_conta = boleto.get("id")
+                if not id_conta:
+                    continue
+
+                link = buscar_link_boleto_por_conta(id_conta)
+
+                if link:
+                    enviar_documento(contact_id, link)
+                    enviados += 1
+
+            if enviados == 0:
+                enviar_mensagem(contact_id, "Não consegui obter os boletos.")
+                return {"status": "ok"}
+
+        elif mensagem in mapa:
+            boleto = mapa[mensagem]
+            id_conta = boleto.get("id")
+
+            if not id_conta:
+                enviar_mensagem(contact_id, "Não encontrei o identificador do boleto.")
+                return {"status": "ok"}
+
+            link = buscar_link_boleto_por_conta(id_conta)
+
+            if not link:
+                enviar_mensagem(contact_id, "Não consegui obter esse boleto.")
+                return {"status": "ok"}
+
+            enviar_documento(contact_id, link)
+
+        else:
+            enviar_mensagem(contact_id, "Opção inválida.")
+            return {"status": "ok"}
+
+        usuarios[contact_id]["estado"] = "FINALIZANDO"
+
+        enviar_mensagem(
+            contact_id,
+            "Posso encerrar o atendimento?\n\n1️⃣ Sim\n2️⃣ Não"
+        )
+        return {"status": "ok"}
+
+    # =====================================================
+    # FINALIZAÇÃO
+    # =====================================================
+    if estado == "FINALIZANDO":
+        if mensagem == "1":
+            enviar_mensagem(contact_id, "Atendimento encerrado ✅")
+            usuarios.pop(contact_id, None)
+
+        elif mensagem == "2":
+            enviar_mensagem(contact_id, "Vou transferir para o financeiro 👨‍💼")
+            usuarios.pop(contact_id, None)
+
+        else:
+            enviar_mensagem(contact_id, "Digite 1 ou 2.")
+
         return {"status": "ok"}
 
     return {"status": "ok"}
