@@ -11,7 +11,6 @@ usuarios = {}
 mensagens_processadas = set()
 
 cache_contatos_por_doc = {}
-cache_boletos_por_contato = {}
 cache_detalhe_conta = {}
 
 ULTIMA_CHAMADA_BLING = 0.0
@@ -243,6 +242,9 @@ def buscar_contato_por_documento(cpf_cnpj):
 
         data = resp.json().get("data", [])
 
+        if pagina == 1 and data:
+            print("AMOSTRA_CONTATO_1:", data[0])
+
         if not data:
             return {"ok": True, "contato": None, "motivo": "nao_encontrado"}
 
@@ -266,12 +268,6 @@ def buscar_contato_por_documento(cpf_cnpj):
 # =====================================================
 
 def buscar_boletos_por_contato(contato_id):
-    if contato_id in cache_boletos_por_contato:
-        return {
-            "ok": True,
-            "boletos": cache_boletos_por_contato[contato_id]
-        }
-
     pagina = 1
     contas = []
 
@@ -325,9 +321,8 @@ def buscar_boletos_por_contato(contato_id):
         conta["_pedido_numero"] = extrair_numero_pedido(conta, detalhe)
         boletos.append(conta)
 
-    cache_boletos_por_contato[contato_id] = boletos
-
     return {"ok": True, "boletos": boletos}
+
 
 def agrupar_boletos_por_pedido(lista):
     pedidos = {}
