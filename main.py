@@ -156,7 +156,9 @@ def conta_esta_paga(conta, detalhe):
         "recebido",
         "pix santander em",
         "rede",
-        "maxipago"
+        "maxipago",
+        "cartão",
+        "cartao",
     ]
 
     return any(t in historico for t in termos_pago)
@@ -167,10 +169,22 @@ def conta_e_boleto(conta, detalhe):
     forma = str(((conta.get("formaPagamento") or {}).get("descricao", ""))).lower()
     link_boleto = str(conta.get("linkBoleto", "") or "").strip()
 
-    if "boleto" in historico:
+    termos_boleto = [
+        "boleto",
+        "santander",
+        "itau",
+        "bradesco",
+        "caixa",
+        "banco do brasil",
+        "bb cobrança",
+        "cobranca bancaria",
+        "cobrança bancária",
+    ]
+
+    if any(t in historico for t in termos_boleto):
         return True
 
-    if "boleto" in forma:
+    if any(t in forma for t in termos_boleto):
         return True
 
     if link_boleto:
@@ -242,9 +256,6 @@ def buscar_contato_por_documento(cpf_cnpj):
 
         data = resp.json().get("data", [])
 
-        if pagina == 1 and data:
-            print("AMOSTRA_CONTATO_1:", data[0])
-
         if not data:
             return {"ok": True, "contato": None, "motivo": "nao_encontrado"}
 
@@ -267,7 +278,7 @@ def buscar_contato_por_documento(cpf_cnpj):
 # BUSCA BOLETOS
 # =====================================================
 
-def buscar_boletos_por_contato(contato_id):
+def buscar_contas_por_contato_id(contato_id):
     pagina = 1
     contas = []
 
@@ -279,10 +290,10 @@ def buscar_boletos_por_contato(contato_id):
         }
 
         resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber:", resp.status_code, "pagina", pagina)
+        print("Bling contas/receber por contato:", resp.status_code, "pagina", pagina)
 
         if resp.status_code != 200:
-            print("Erro contas:", resp.text)
+            print("Erro contas por contato:", resp.text)
             return {"ok": False, "erro": "falha_consulta"}
 
         dados = resp.json().get("data", [])
@@ -297,6 +308,48 @@ def buscar_boletos_por_contato(contato_id):
 
         pagina += 1
 
+    return {"ok": True, "contas": contas}
+
+
+def buscar_contas_por_documento(cpf_cnpj):
+    cpf_cnpj = limpar_documento(cpf_cnpj)
+    pagina = 1
+    contas = []
+
+    while pagina <= 30:
+        params = {
+            "pagina": pagina,
+            "limite": 100
+        }
+
+        resp = bling_get("/contas/receber", params=params)
+        print("Bling contas/receber geral:", resp.status_code, "pagina", pagina)
+
+        if resp.status_code != 200:
+            print("Erro contas geral:", resp.text)
+            return {"ok": False, "erro": "falha_consulta"}
+
+        dados = resp.json().get("data", [])
+
+        if not dados:
+            break
+
+        for conta in dados:
+            contato = conta.get("contato", {}) or {}
+            doc = limpar_documento(contato.get("numeroDocumento", ""))
+
+            if doc == cpf_cnpj:
+                contas.append(conta)
+
+        if len(dados) < 100:
+            break
+
+        pagina += 1
+
+    return {"ok": True, "contas": contas}
+
+
+def filtrar_boletos(contas):
     boletos = []
 
     for conta in contas:
@@ -321,6 +374,35 @@ def buscar_boletos_por_contato(contato_id):
         conta["_pedido_numero"] = extrair_numero_pedido(conta, detalhe)
         boletos.append(conta)
 
+    return boletos
+
+
+def deduplicar_contas(contas):
+    unicas = {}
+    for conta in contas:
+        conta_id = conta.get("id")
+        if conta_id:
+            unicas[conta_id] = conta
+    return list(unicas.values())
+
+
+def buscar_boletos_por_contato_ou_documento(contato_id, cpf_cnpj):
+    resp1 = buscar_contas_por_contato_id(contato_id)
+    if not resp1["ok"]:
+        return {"ok": False, "erro": "falha_consulta"}
+
+    contas_id = resp1["contas"]
+
+    resp2 = buscar_contas_por_documento(cpf_cnpj)
+    if not resp2["ok"]:
+        return {"ok": False, "erro": "falha_consulta"}
+
+    contas_doc = resp2["contas"]
+
+    contas = deduplicar_contas(contas_id + contas_doc)
+    print("TOTAL_CONTAS_COMBINADAS:", len(contas))
+
+    boletos = filtrar_boletos(contas)
     return {"ok": True, "boletos": boletos}
 
 
@@ -452,7 +534,7 @@ async def webhook(request: Request):
             contato.get("numeroDocumento")
         )
 
-        resp_boletos = buscar_boletos_por_contato(contato["id"])
+        resp_boletos = buscar_boletos_por_contato_ou_documento(contato["id"], cpf)
         print("RESPOSTA_BOLETOS_DEBUG:", resp_boletos)
 
         if not resp_boletos["ok"]:
