@@ -102,7 +102,6 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2):
     }
 
     url = f"{BLING_BASE_URL}{endpoint}"
-
     resp = requests.get(url, headers=headers, params=params, timeout=30)
 
     if resp.status_code == 401 and retry_on_401:
@@ -136,6 +135,7 @@ def buscar_detalhe_conta(id_conta):
     print("DETALHE_CONTA_STATUS:", id_conta, resp.status_code)
 
     if resp.status_code != 200:
+        print("Erro detalhe conta:", resp.text)
         return None
 
     data = resp.json().get("data", {})
@@ -147,34 +147,24 @@ def buscar_detalhe_conta(id_conta):
 # REGRAS DE NEGÓCIO
 # =====================================================
 
-def conta_esta_paga(conta, detalhe):
+def extrair_numero_pedido(conta):
+    origem = conta.get("origem", {}) or {}
+    numero_pedido = str(origem.get("numero", "")).strip()
+    return numero_pedido or "Sem pedido"
+
+
+def conta_em_aberto(conta):
     try:
-        saldo = float((detalhe or {}).get("saldo", 0) or 0)
+        situacao = int(conta.get("situacao", 0) or 0)
     except Exception:
-        saldo = 0
+        situacao = 0
 
-    return saldo <= 0
+    return situacao in (1, 3)
 
 
-def conta_e_boleto(conta, detalhe):
+def conta_e_boleto(detalhe):
     link_boleto = str((detalhe or {}).get("linkBoleto", "") or "").strip()
-
-    try:
-        saldo = float((detalhe or {}).get("saldo", 0) or 0)
-    except Exception:
-        saldo = 0
-
-    return bool(link_boleto) and saldo > 0
-
-
-def extrair_numero_pedido(conta, detalhe):
-    origem = (detalhe or {}).get("origem", {}) or conta.get("origem", {}) or {}
-    numero_origem = origem.get("numero")
-
-    if numero_origem:
-        return str(numero_origem).strip()
-
-    return "Sem pedido"
+    return bool(link_boleto)
 
 
 def deduplicar_contas(contas):
@@ -278,7 +268,7 @@ def buscar_contas_por_documento(cpf_cnpj):
     pagina = 1
     contas = []
 
-    while pagina <= 30:
+    while pagina <= 60:
         params = {
             "pagina": pagina,
             "limite": 100
@@ -312,6 +302,7 @@ def buscar_contas_por_documento(cpf_cnpj):
 
 
 def buscar_contas_por_numero_pedido(numero_pedido):
+    numero_pedido = str(numero_pedido).strip()
     pagina = 1
     contas = []
 
@@ -334,10 +325,8 @@ def buscar_contas_por_numero_pedido(numero_pedido):
             break
 
         for conta in dados:
-            origem = conta.get("origem", {}) or {}
-            numero_origem = str(origem.get("numero") or "").strip()
-
-            if numero_origem == str(numero_pedido).strip():
+            pedido = extrair_numero_pedido(conta)
+            if pedido == numero_pedido:
                 contas.append(conta)
 
         if len(dados) < 100:
@@ -348,30 +337,38 @@ def buscar_contas_por_numero_pedido(numero_pedido):
     return {"ok": True, "contas": contas}
 
 
-def filtrar_boletos(contas):
+def filtrar_boletos(contas, numero_pedido=None):
     boletos = []
+    numero_pedido = str(numero_pedido).strip() if numero_pedido else None
 
     for conta in contas:
         detalhe = buscar_detalhe_conta(conta.get("id"))
+        pedido = extrair_numero_pedido(conta)
 
         print(
             "FILTRO_CONTA:",
             conta.get("id"),
+            "pedido=", pedido,
             "situacao=", conta.get("situacao"),
-            "origem=", (conta.get("origem") or {}).get("numero"),
             "linkBoleto=", (detalhe or {}).get("linkBoleto", ""),
             "saldo=", (detalhe or {}).get("saldo", ""),
             "historico=", (detalhe or {}).get("historico", "")
         )
 
-        if conta_esta_paga(conta, detalhe):
+        if numero_pedido and pedido != numero_pedido:
             continue
 
-        if not conta_e_boleto(conta, detalhe):
+        if not detalhe:
+            continue
+
+        if not conta_em_aberto(conta):
+            continue
+
+        if not conta_e_boleto(detalhe):
             continue
 
         conta["_detalhe"] = detalhe
-        conta["_pedido_numero"] = extrair_numero_pedido(conta, detalhe)
+        conta["_pedido_numero"] = pedido
         boletos.append(conta)
 
     return boletos
@@ -397,7 +394,7 @@ def buscar_boletos_completo(contato_id, cpf_cnpj, numero_pedido=None):
     contas = deduplicar_contas(contas)
     print("TOTAL_CONTAS_COMBINADAS:", len(contas))
 
-    boletos = filtrar_boletos(contas)
+    boletos = filtrar_boletos(contas, numero_pedido=numero_pedido)
     return {"ok": True, "boletos": boletos}
 
 
@@ -478,18 +475,12 @@ async def webhook(request: Request):
 
     if mensagem == "teste boleto":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
-        enviar_mensagem(
-            contact_id,
-            "Digite seu CPF ou CNPJ para localizar seus boletos."
-        )
+        enviar_mensagem(contact_id, "Digite seu CPF ou CNPJ para localizar seus boletos.")
         return {"status": "ok"}
 
     if comando == "SEGUNDA_VIA":
         usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
-        enviar_mensagem(
-            contact_id,
-            "Digite seu CPF ou CNPJ para localizar seus boletos."
-        )
+        enviar_mensagem(contact_id, "Digite seu CPF ou CNPJ para localizar seus boletos.")
         return {"status": "ok"}
 
     if estado == "AGUARDANDO_CPF":
@@ -527,20 +518,14 @@ async def webhook(request: Request):
             print("RESPOSTA_CONTATO_DEBUG:", resp_contato)
 
             if not resp_contato["ok"]:
-                enviar_mensagem(
-                    contact_id,
-                    "Estou com instabilidade na consulta agora. Tente novamente em instantes."
-                )
+                enviar_mensagem(contact_id, "Estou com instabilidade na consulta agora. Tente novamente em instantes.")
                 usuarios.pop(contact_id, None)
                 return {"status": "ok"}
 
             contato = resp_contato["contato"]
 
             if not contato:
-                enviar_mensagem(
-                    contact_id,
-                    "Cadastro não localizado para esse CPF/CNPJ."
-                )
+                enviar_mensagem(contact_id, "Cadastro não localizado para esse CPF/CNPJ.")
                 usuarios.pop(contact_id, None)
                 return {"status": "ok"}
 
@@ -562,10 +547,7 @@ async def webhook(request: Request):
             boletos = resp_boletos["boletos"]
 
             if not boletos:
-                enviar_mensagem(
-                    contact_id,
-                    "Não encontrei boletos em aberto ou em atraso para esse cadastro."
-                )
+                enviar_mensagem(contact_id, "Não encontrei boletos em aberto ou em atraso para esse cadastro.")
                 usuarios.pop(contact_id, None)
                 return {"status": "ok"}
 
@@ -613,7 +595,11 @@ async def webhook(request: Request):
             usuarios.pop(contact_id, None)
             return {"status": "ok"}
 
-        resp_boletos = buscar_boletos_completo(contato["id"], cpf, numero_pedido=numero_pedido)
+        resp_boletos = buscar_boletos_completo(
+            contato["id"],
+            cpf,
+            numero_pedido=numero_pedido
+        )
         print("RESPOSTA_BOLETOS_DEBUG:", resp_boletos)
 
         if not resp_boletos["ok"]:
