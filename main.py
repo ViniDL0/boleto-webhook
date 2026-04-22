@@ -92,7 +92,7 @@ def enviar_documento(contact_id, url_pdf):
 # BLING
 # =====================================================
 
-def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2):
+def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2, retry_on_5xx=2):
     aguardar_limite_bling()
 
     token = obter_access_token()
@@ -111,7 +111,8 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2):
             endpoint,
             params=params,
             retry_on_401=False,
-            retry_on_429=retry_on_429
+            retry_on_429=retry_on_429,
+            retry_on_5xx=retry_on_5xx
         )
 
     if resp.status_code == 429 and retry_on_429 > 0:
@@ -121,7 +122,19 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2):
             endpoint,
             params=params,
             retry_on_401=retry_on_401,
-            retry_on_429=retry_on_429 - 1
+            retry_on_429=retry_on_429 - 1,
+            retry_on_5xx=retry_on_5xx
+        )
+
+    if resp.status_code in (502, 503, 504) and retry_on_5xx > 0:
+        print(f"Erro {resp.status_code} no Bling. Aguardando 2s para tentar novamente...")
+        time.sleep(2)
+        return bling_get(
+            endpoint,
+            params=params,
+            retry_on_401=retry_on_401,
+            retry_on_429=retry_on_429,
+            retry_on_5xx=retry_on_5xx - 1
         )
 
     return resp
@@ -268,7 +281,7 @@ def buscar_contas_por_documento(cpf_cnpj):
     pagina = 1
     contas = []
 
-    while pagina <= 60:
+    while pagina <= 20:
         params = {
             "pagina": pagina,
             "limite": 100
