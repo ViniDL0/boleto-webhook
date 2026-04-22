@@ -1,8 +1,6 @@
 import os
 import re
 import time
-import asyncio
-from collections import defaultdict
 from datetime import datetime
 from typing import Optional
 
@@ -27,7 +25,7 @@ MAX_PAGINAS_CONTAS_POR_PEDIDO = 80
 # Situações consideradas em aberto
 SITUACOES_EM_ABERTO = {1, 3}
 
-# Controle simples de estado por ticket
+# Controle de estado por ticket
 ESTADOS = {}
 CACHE_CONTATOS = {}
 
@@ -41,10 +39,6 @@ def so_numeros(valor: str) -> str:
 
 def texto_normalizado(valor: str) -> str:
     return (valor or "").strip().lower()
-
-
-def agora_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def headers_bling():
@@ -108,6 +102,23 @@ def limpar_estado(ticket_id: str):
     }
 
 
+def formatar_valor(valor):
+    try:
+        return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return f"R$ {valor}"
+
+
+def montar_lista_boletos(boletos: list) -> str:
+    linhas = ["Encontrei os seguintes boletos:\n"]
+    for i, b in enumerate(boletos, start=1):
+        linhas.append(
+            f"{i}️⃣ {formatar_valor(b.get('valor'))} - vence {b.get('vencimento')} - situação {b.get('situacao')}"
+        )
+    linhas.append("\nDigite o número ou TODOS.")
+    return "\n".join(linhas)
+
+
 # =========================
 # DIGISAC
 # =========================
@@ -124,7 +135,7 @@ def enviar_mensagem(contact_id: str, texto: str):
 
 
 def enviar_documento(contact_id: str, url_pdf: str):
-    # Correção: envia como texto com link para evitar "undefined"
+    # Envia o link do boleto em texto para evitar "undefined"
     texto = f"Segue seu boleto:\n{url_pdf}"
     return enviar_mensagem(contact_id, texto)
 
@@ -244,7 +255,6 @@ def conta_pertence_ao_pedido(conta: dict, pedido: str) -> bool:
     if origem_numero == pedido:
         return True
 
-    # fallback
     if pedido in detalhe_numero_documento:
         return True
 
@@ -295,7 +305,7 @@ def ordenar_boletos(boletos: list):
 def buscar_boletos_por_contato(contato_id: int, pedido: Optional[str] = None):
     contas_map = {}
 
-    # 1) Contas por contato
+    # 1) Por contato
     for pagina in range(1, 3):
         params = {"pagina": pagina, "limite": 100, "idContato": contato_id}
         resp = request_bling("GET", "/contas/receber", params=params)
@@ -315,7 +325,7 @@ def buscar_boletos_por_contato(contato_id: int, pedido: Optional[str] = None):
         for item in data:
             contas_map[item["id"]] = item
 
-    # 2) Contas gerais
+    # 2) Geral
     for pagina in range(1, MAX_PAGINAS_CONTAS_GERAL + 1):
         params = {"pagina": pagina, "limite": 100}
         resp = request_bling("GET", "/contas/receber", params=params)
@@ -355,8 +365,6 @@ def buscar_boletos_por_contato(contato_id: int, pedido: Optional[str] = None):
             if not data:
                 break
 
-            achou_na_pagina = False
-
             for item in data:
                 origem = item.get("origem") or {}
                 origem_numero = str(origem.get("numero") or "").strip()
@@ -374,10 +382,6 @@ def buscar_boletos_por_contato(contato_id: int, pedido: Optional[str] = None):
                         "situacao=", item.get("situacao"),
                     )
                     contas_map[item["id"]] = item
-                    achou_na_pagina = True
-
-            if achou_na_pagina and pagina > 1:
-                pass
 
     contas = list(contas_map.values())
     print("TOTAL_CONTAS_COMBINADAS:", len(contas))
@@ -399,26 +403,6 @@ def buscar_boletos_por_contato(contato_id: int, pedido: Optional[str] = None):
 
     boletos_validos = ordenar_boletos(boletos_validos)
     return {"ok": True, "boletos": boletos_validos}
-
-
-# =========================
-# FORMATADORES
-# =========================
-def formatar_valor(valor):
-    try:
-        return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return f"R$ {valor}"
-
-
-def montar_lista_boletos(boletos: list) -> str:
-    linhas = ["Encontrei os seguintes boletos:\n"]
-    for i, b in enumerate(boletos, start=1):
-        linhas.append(
-            f"{i}️⃣ {formatar_valor(b.get('valor'))} - vence {b.get('vencimento')} - situação {b.get('situacao')}"
-        )
-    linhas.append("\nDigite o número ou TODOS.")
-    return "\n".join(linhas)
 
 
 # =========================
@@ -448,6 +432,13 @@ async def webhook(request: Request):
     texto_limpo = texto_normalizado(texto)
     numeros = so_numeros(texto)
 
+    # ============================================
+    # TRAVA DE SEGURANÇA
+    # Só entra no fluxo se começar com "teste boleto"
+    # ============================================
+    if estado["etapa"] == "idle" and texto_limpo != "teste boleto":
+        return {"ok": True, "ignorado": True}
+
     # =====================
     # INÍCIO DO FLUXO
     # =====================
@@ -461,7 +452,7 @@ async def webhook(request: Request):
     # =====================
     # CPF / CNPJ
     # =====================
-    if estado["etapa"] in ("aguardando_documento", "idle"):
+    if estado["etapa"] == "aguardando_documento":
         if len(numeros) not in (11, 14):
             enviar_mensagem(contact_id, "CPF ou CNPJ inválido. Digite apenas números.")
             return {"ok": True}
@@ -471,6 +462,7 @@ async def webhook(request: Request):
 
         if not resp_contato["ok"]:
             enviar_mensagem(contact_id, "Não localizei cadastro para esse CPF/CNPJ.")
+            limpar_estado(ticket_id)
             return {"ok": True}
 
         estado["cpf_cnpj"] = numeros
@@ -505,6 +497,7 @@ async def webhook(request: Request):
 
             if not resp_boletos["ok"]:
                 enviar_mensagem(contact_id, "Erro ao consultar boletos.")
+                limpar_estado(ticket_id)
                 return {"ok": True}
 
             boletos = resp_boletos["boletos"]
@@ -540,6 +533,7 @@ async def webhook(request: Request):
 
         if not resp_boletos["ok"]:
             enviar_mensagem(contact_id, "Erro ao consultar boletos.")
+            limpar_estado(ticket_id)
             return {"ok": True}
 
         boletos = resp_boletos["boletos"]
