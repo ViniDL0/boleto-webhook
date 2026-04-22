@@ -1,740 +1,618 @@
-from fastapi import FastAPI, Request
-import requests
+import os
+import re
 import time
+import asyncio
+from collections import defaultdict
+from datetime import datetime
+from typing import Optional
 
-from auth_bling import obter_access_token, forcar_refresh
-from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL
+import requests
+from fastapi import FastAPI, Request
 
 app = FastAPI()
 
-usuarios = {}
-mensagens_processadas = set()
+# =========================
+# CONFIG
+# =========================
+DIGISAC_TOKEN = os.getenv("DIGISAC_TOKEN", "").strip()
+DIGISAC_BASE_URL = os.getenv("DIGISAC_BASE_URL", "").strip().rstrip("/")
+BLING_ACCESS_TOKEN = os.getenv("BLING_ACCESS_TOKEN", "").strip()
+BLING_BASE_URL = "https://api.bling.com.br/Api/v3"
 
-cache_contatos_por_doc = {}
-cache_detalhe_conta = {}
+TIMEOUT = 60
+MAX_PAGINAS_CONTATOS = 220
+MAX_PAGINAS_CONTAS_GERAL = 80
+MAX_PAGINAS_CONTAS_POR_PEDIDO = 80
 
-ULTIMA_CHAMADA_BLING = 0.0
-INTERVALO_MINIMO_BLING = 0.4
+# Situações consideradas em aberto
+SITUACOES_EM_ABERTO = {1, 3}
 
-
-# =====================================================
-# UTIL
-# =====================================================
-
-def limpar_documento(doc):
-    return "".join(ch for ch in str(doc or "") if ch.isdigit())
-
-
-def formatar_valor(valor):
-    try:
-        return f"{float(valor):.2f}".replace(".", ",")
-    except Exception:
-        return str(valor)
+# Controle simples de estado por ticket
+ESTADOS = {}
+CACHE_CONTATOS = {}
 
 
-def aguardar_limite_bling():
-    global ULTIMA_CHAMADA_BLING
-
-    agora = time.time()
-    delta = agora - ULTIMA_CHAMADA_BLING
-
-    if delta < INTERVALO_MINIMO_BLING:
-        time.sleep(INTERVALO_MINIMO_BLING - delta)
-
-    ULTIMA_CHAMADA_BLING = time.time()
+# =========================
+# HELPERS
+# =========================
+def so_numeros(valor: str) -> str:
+    return re.sub(r"\D", "", valor or "")
 
 
-# =====================================================
-# DIGISAC
-# =====================================================
+def texto_normalizado(valor: str) -> str:
+    return (valor or "").strip().lower()
 
-def enviar_mensagem(contact_id, texto):
-    url = f"{DIGISAC_BASE_URL}/messages"
 
-    headers = {
-        "Authorization": f"Bearer {DIGISAC_TOKEN}",
-        "Content-Type": "application/json"
+def agora_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def headers_bling():
+    return {
+        "Authorization": f"Bearer {BLING_ACCESS_TOKEN}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
+
+def headers_digisac():
+    return {
+        "Authorization": f"Bearer {DIGISAC_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+
+def extrair_texto(payload: dict) -> str:
+    return (payload.get("data") or {}).get("text") or ""
+
+
+def extrair_ticket_id(payload: dict) -> Optional[str]:
+    return (payload.get("data") or {}).get("ticketId")
+
+
+def extrair_contact_id(payload: dict) -> Optional[str]:
+    return (payload.get("data") or {}).get("contactId")
+
+
+def eh_mensagem_cliente(payload: dict) -> bool:
+    data = payload.get("data") or {}
+    return (
+        payload.get("event") == "message.created"
+        and not data.get("isFromMe", False)
+        and data.get("type") == "chat"
+        and bool((data.get("text") or "").strip())
+    )
+
+
+def obter_estado(ticket_id: str) -> dict:
+    if ticket_id not in ESTADOS:
+        ESTADOS[ticket_id] = {
+            "etapa": "idle",
+            "cpf_cnpj": None,
+            "contato_bling": None,
+            "modo_consulta": None,
+            "pedido": None,
+            "boletos": [],
+        }
+    return ESTADOS[ticket_id]
+
+
+def limpar_estado(ticket_id: str):
+    ESTADOS[ticket_id] = {
+        "etapa": "idle",
+        "cpf_cnpj": None,
+        "contato_bling": None,
+        "modo_consulta": None,
+        "pedido": None,
+        "boletos": [],
+    }
+
+
+# =========================
+# DIGISAC
+# =========================
+def enviar_mensagem(contact_id: str, texto: str):
+    url = f"{DIGISAC_BASE_URL}/messages"
     body = {
         "contactId": contact_id,
         "type": "chat",
         "text": texto
     }
-
-    resp = requests.post(url, json=body, headers=headers, timeout=30)
+    resp = requests.post(url, json=body, headers=headers_digisac(), timeout=30)
     print("Digisac mensagem:", resp.status_code, resp.text)
     return resp
 
 
-def enviar_documento(contact_id, url_pdf):
-    url = f"{DIGISAC_BASE_URL}/messages"
-
-    headers = {
-        "Authorization": f"Bearer {DIGISAC_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    body = {
-        "contactId": contact_id,
-        "type": "document",
-        "document": {
-            "url": url_pdf
-        }
-    }
-
-    resp = requests.post(url, json=body, headers=headers, timeout=30)
-    print("Digisac documento:", resp.status_code, resp.text)
-    return resp
+def enviar_documento(contact_id: str, url_pdf: str):
+    # Correção: envia como texto com link para evitar "undefined"
+    texto = f"Segue seu boleto:\n{url_pdf}"
+    return enviar_mensagem(contact_id, texto)
 
 
-# =====================================================
-# BLING
-# =====================================================
-
-def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2, retry_on_5xx=2):
-    aguardar_limite_bling()
-
-    token = obter_access_token()
-
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
-
+# =========================
+# BLING BASE
+# =========================
+def request_bling(method: str, endpoint: str, params=None, max_retries=4):
     url = f"{BLING_BASE_URL}{endpoint}"
-    resp = requests.get(url, headers=headers, params=params, timeout=30)
+    tentativa = 0
 
-    if resp.status_code == 401 and retry_on_401:
-        print("Token expirado. Renovando...")
-        forcar_refresh()
-        return bling_get(
-            endpoint,
-            params=params,
-            retry_on_401=False,
-            retry_on_429=retry_on_429,
-            retry_on_5xx=retry_on_5xx
-        )
+    while tentativa < max_retries:
+        tentativa += 1
+        try:
+            resp = requests.request(
+                method,
+                url,
+                headers=headers_bling(),
+                params=params,
+                timeout=TIMEOUT,
+            )
 
-    if resp.status_code == 429 and retry_on_429 > 0:
-        print("Rate limit Bling. Aguardando 1s...")
-        time.sleep(1)
-        return bling_get(
-            endpoint,
-            params=params,
-            retry_on_401=retry_on_401,
-            retry_on_429=retry_on_429 - 1,
-            retry_on_5xx=retry_on_5xx
-        )
+            if resp.status_code == 429:
+                espera = min(2 * tentativa, 8)
+                print(f"Rate limit Bling. Aguardando {espera}s...")
+                time.sleep(espera)
+                continue
 
-    if resp.status_code in (502, 503, 504) and retry_on_5xx > 0:
-        print(f"Erro {resp.status_code} no Bling. Aguardando 2s para tentar novamente...")
-        time.sleep(2)
-        return bling_get(
-            endpoint,
-            params=params,
-            retry_on_401=retry_on_401,
-            retry_on_429=retry_on_429,
-            retry_on_5xx=retry_on_5xx - 1
-        )
+            if resp.status_code in (500, 502, 503, 504):
+                espera = min(2 * tentativa, 8)
+                print(f"Bling {resp.status_code}. Retry em {espera}s...")
+                time.sleep(espera)
+                continue
 
-    return resp
+            return resp
 
-
-def buscar_detalhe_conta(id_conta):
-    if id_conta in cache_detalhe_conta:
-        return cache_detalhe_conta[id_conta]
-
-    resp = bling_get(f"/contas/receber/{id_conta}")
-    print("DETALHE_CONTA_STATUS:", id_conta, resp.status_code)
-
-    if resp.status_code != 200:
-        print("Erro detalhe conta:", resp.text)
-        return None
-
-    data = resp.json().get("data", {})
-    cache_detalhe_conta[id_conta] = data
-    return data
-
-
-# =====================================================
-# REGRAS DE NEGÓCIO
-# =====================================================
-
-def extrair_numero_pedido(conta):
-    origem = conta.get("origem", {}) or {}
-    numero_pedido = str(origem.get("numero", "")).strip()
-    return numero_pedido or "Sem pedido"
-
-
-def conta_em_aberto(conta):
-    try:
-        situacao = int(conta.get("situacao", 0) or 0)
-    except Exception:
-        situacao = 0
-
-    return situacao in (1, 3)
-
-
-def conta_e_boleto(detalhe):
-    link_boleto = str((detalhe or {}).get("linkBoleto", "") or "").strip()
-    return bool(link_boleto)
-
-
-def deduplicar_contas(contas):
-    unicas = {}
-    for conta in contas:
-        conta_id = conta.get("id")
-        if conta_id:
-            unicas[conta_id] = conta
-    return list(unicas.values())
-
-
-def buscar_link_boleto_do_item(boleto):
-    detalhe = boleto.get("_detalhe", {}) or {}
-    link = str(detalhe.get("linkBoleto", "") or "").strip()
-
-    if link:
-        return link
-
-    link = str(boleto.get("linkBoleto", "") or "").strip()
-    if link:
-        return link
+        except requests.RequestException as e:
+            espera = min(2 * tentativa, 8)
+            print(f"Erro de conexão Bling: {e}. Retry em {espera}s...")
+            time.sleep(espera)
 
     return None
 
 
-# =====================================================
-# BUSCA CONTATO
-# =====================================================
+# =========================
+# CONTATOS BLING
+# =========================
+def buscar_contato_por_documento(cpf_cnpj: str):
+    cpf_cnpj = so_numeros(cpf_cnpj)
 
-def buscar_contato_por_documento(cpf_cnpj):
-    cpf_cnpj = limpar_documento(cpf_cnpj)
-
-    if cpf_cnpj in cache_contatos_por_doc:
+    if cpf_cnpj in CACHE_CONTATOS:
         return {
             "ok": True,
-            "contato": cache_contatos_por_doc[cpf_cnpj],
-            "motivo": "cache"
+            "contato": CACHE_CONTATOS[cpf_cnpj],
+            "motivo": "cache",
         }
 
-    pagina = 1
-    max_paginas = 220
-
-    while pagina <= max_paginas:
+    for pagina in range(1, MAX_PAGINAS_CONTATOS + 1):
         params = {
             "pagina": pagina,
-            "limite": 100
+            "limite": 100,
         }
 
-        resp = bling_get("/contatos", params=params)
-        print("Bling contatos:", resp.status_code, "pagina", pagina)
+        resp = request_bling("GET", "/contatos", params=params)
+        if not resp:
+            return {"ok": False, "erro": "falha_conexao"}
+
+        print(f"Bling contatos: {resp.status_code} pagina {pagina}")
 
         if resp.status_code != 200:
             print("Erro contatos:", resp.text)
             return {"ok": False, "erro": "falha_consulta"}
 
         data = resp.json().get("data", [])
-
         if not data:
-            return {"ok": True, "contato": None, "motivo": "nao_encontrado"}
+            break
 
-        for contato in data:
-            doc = limpar_documento(contato.get("numeroDocumento", ""))
-
+        for item in data:
+            doc = so_numeros(item.get("numeroDocumento"))
             if doc == cpf_cnpj:
-                cache_contatos_por_doc[cpf_cnpj] = contato
-                return {"ok": True, "contato": contato, "motivo": "encontrado"}
+                CACHE_CONTATOS[cpf_cnpj] = item
+                return {
+                    "ok": True,
+                    "contato": item,
+                    "motivo": "encontrado",
+                }
 
-        if len(data) < 100:
-            return {"ok": True, "contato": None, "motivo": "nao_encontrado"}
-
-        pagina += 1
-
-    return {"ok": True, "contato": None, "motivo": "limite_paginas"}
+    return {"ok": False, "erro": "contato_nao_encontrado"}
 
 
-# =====================================================
-# BUSCA CONTAS
-# =====================================================
+# =========================
+# CONTAS / BOLETOS
+# =========================
+def buscar_conta_receber_detalhe(id_conta: int):
+    resp = request_bling("GET", f"/contas/receber/{id_conta}")
+    if not resp:
+        return None
 
-def buscar_contas_por_contato_id(contato_id):
-    pagina = 1
-    contas = []
+    print(f"DETALHE_CONTA_STATUS: {id_conta} {resp.status_code}")
 
-    while pagina <= 10:
-        params = {
-            "pagina": pagina,
-            "limite": 100,
-            "idContato": contato_id
-        }
+    if resp.status_code != 200:
+        return None
 
-        resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber por contato:", resp.status_code, "pagina", pagina)
+    return (resp.json() or {}).get("data")
+
+
+def conta_pertence_ao_pedido(conta: dict, pedido: str) -> bool:
+    pedido = str(pedido).strip()
+
+    origem = conta.get("origem") or {}
+    detalhe = conta.get("_detalhe") or {}
+
+    origem_numero = str(origem.get("numero") or "").strip()
+    detalhe_numero_documento = str(detalhe.get("numeroDocumento") or "").strip()
+    detalhe_historico = str(detalhe.get("historico") or "")
+
+    if origem_numero == pedido:
+        return True
+
+    # fallback
+    if pedido in detalhe_numero_documento:
+        return True
+
+    if pedido in detalhe_historico:
+        return True
+
+    return False
+
+
+def boleto_valido(conta: dict) -> bool:
+    detalhe = conta.get("_detalhe") or {}
+    situacao = conta.get("situacao")
+    link_boleto = conta.get("linkBoleto") or detalhe.get("linkBoleto") or ""
+    saldo = detalhe.get("saldo", conta.get("valor", 0)) or 0
+
+    print(
+        "FILTRO_CONTA:",
+        conta.get("id"),
+        "pedido=", (conta.get("origem") or {}).get("numero", "Sem pedido"),
+        "situacao=", situacao,
+        "linkBoleto=", link_boleto,
+        "saldo=", saldo,
+        "historico=", detalhe.get("historico", ""),
+    )
+
+    if situacao not in SITUACOES_EM_ABERTO:
+        return False
+
+    if not link_boleto:
+        return False
+
+    if float(saldo) <= 0:
+        return False
+
+    return True
+
+
+def ordenar_boletos(boletos: list):
+    def chave(b):
+        return (
+            b.get("vencimento") or "9999-12-31",
+            b.get("id") or 0,
+        )
+
+    return sorted(boletos, key=chave)
+
+
+def buscar_boletos_por_contato(contato_id: int, pedido: Optional[str] = None):
+    contas_map = {}
+
+    # 1) Contas por contato
+    for pagina in range(1, 3):
+        params = {"pagina": pagina, "limite": 100, "idContato": contato_id}
+        resp = request_bling("GET", "/contas/receber", params=params)
+        if not resp:
+            return {"ok": False, "erro": "falha_consulta"}
+
+        print(f"Bling contas/receber por contato: {resp.status_code} pagina {pagina}")
 
         if resp.status_code != 200:
             print("Erro contas por contato:", resp.text)
             return {"ok": False, "erro": "falha_consulta"}
 
-        dados = resp.json().get("data", [])
-
-        if not dados:
+        data = (resp.json() or {}).get("data", [])
+        if not data:
             break
 
-        contas.extend(dados)
+        for item in data:
+            contas_map[item["id"]] = item
 
-        if len(dados) < 100:
-            break
+    # 2) Contas gerais
+    for pagina in range(1, MAX_PAGINAS_CONTAS_GERAL + 1):
+        params = {"pagina": pagina, "limite": 100}
+        resp = request_bling("GET", "/contas/receber", params=params)
+        if not resp:
+            return {"ok": False, "erro": "falha_consulta"}
 
-        pagina += 1
-
-    return {"ok": True, "contas": contas}
-
-
-def buscar_contas_por_documento(cpf_cnpj):
-    cpf_cnpj = limpar_documento(cpf_cnpj)
-    pagina = 1
-    contas = []
-
-    while pagina <= 20:
-        params = {
-            "pagina": pagina,
-            "limite": 100
-        }
-
-        resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber geral:", resp.status_code, "pagina", pagina)
+        print(f"Bling contas/receber geral: {resp.status_code} pagina {pagina}")
 
         if resp.status_code != 200:
             print("Erro contas geral:", resp.text)
             return {"ok": False, "erro": "falha_consulta"}
 
-        dados = resp.json().get("data", [])
-
-        if not dados:
+        data = (resp.json() or {}).get("data", [])
+        if not data:
             break
 
-        for conta in dados:
-            contato = conta.get("contato", {}) or {}
-            doc = limpar_documento(contato.get("numeroDocumento", ""))
+        for item in data:
+            contato = item.get("contato") or {}
+            if int(contato.get("id") or 0) == int(contato_id):
+                contas_map[item["id"]] = item
 
-            if doc == cpf_cnpj:
-                contas.append(conta)
+    # 3) Varredura por pedido
+    if pedido:
+        for pagina in range(1, MAX_PAGINAS_CONTAS_POR_PEDIDO + 1):
+            params = {"pagina": pagina, "limite": 100}
+            resp = request_bling("GET", "/contas/receber", params=params)
+            if not resp:
+                return {"ok": False, "erro": "falha_consulta"}
 
-        if len(dados) < 100:
-            break
+            print(f"Bling contas/receber por pedido: {resp.status_code} pagina {pagina}")
 
-        pagina += 1
+            if resp.status_code != 200:
+                print("Erro contas por pedido:", resp.text)
+                return {"ok": False, "erro": "falha_consulta"}
 
-    return {"ok": True, "contas": contas}
+            data = (resp.json() or {}).get("data", [])
+            if not data:
+                break
 
+            achou_na_pagina = False
 
-def buscar_contas_por_numero_pedido(numero_pedido):
-    numero_pedido = str(numero_pedido).strip()
-    pagina = 1
-    contas = []
+            for item in data:
+                origem = item.get("origem") or {}
+                origem_numero = str(origem.get("numero") or "").strip()
+                contato = item.get("contato") or {}
+                doc = so_numeros(contato.get("numeroDocumento"))
 
-    while pagina <= 60:
-        params = {
-            "pagina": pagina,
-            "limite": 100
-        }
+                if origem_numero == str(pedido).strip():
+                    print(
+                        "PEDIDO_ENCONTRADO_NA_VARREDURA:",
+                        "pagina=", pagina,
+                        "conta_id=", item.get("id"),
+                        "pedido=", origem_numero,
+                        "contato_id=", contato.get("id"),
+                        "documento=", doc,
+                        "situacao=", item.get("situacao"),
+                    )
+                    contas_map[item["id"]] = item
+                    achou_na_pagina = True
 
-        resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber por pedido:", resp.status_code, "pagina", pagina)
+            if achou_na_pagina and pagina > 1:
+                pass
 
-        if resp.status_code != 200:
-            print("Erro contas por pedido:", resp.text)
-            return {"ok": False, "erro": "falha_consulta"}
+    contas = list(contas_map.values())
+    print("TOTAL_CONTAS_COMBINADAS:", len(contas))
 
-        dados = resp.json().get("data", [])
-
-        if not dados:
-            break
-
-        for conta in dados:
-            origem = conta.get("origem", {}) or {}
-            pedido = str(origem.get("numero", "")).strip()
-
-            if pedido:
-                print(
-                    "PEDIDO_ENCONTRADO_NA_VARREDURA:",
-                    "pagina=", pagina,
-                    "conta_id=", conta.get("id"),
-                    "pedido=", pedido,
-                    "contato_id=", (conta.get("contato") or {}).get("id"),
-                    "documento=", (conta.get("contato") or {}).get("numeroDocumento"),
-                    "situacao=", conta.get("situacao")
-                )
-
-            if pedido == numero_pedido:
-                print("MATCH_PEDIDO:", conta)
-                contas.append(conta)
-
-        if len(dados) < 100:
-            break
-
-        pagina += 1
-
-    return {"ok": True, "contas": contas}
-
-
-def filtrar_boletos(contas, numero_pedido=None):
-    boletos = []
-    numero_pedido = str(numero_pedido).strip() if numero_pedido else None
-
+    boletos_validos = []
     for conta in contas:
-        detalhe = buscar_detalhe_conta(conta.get("id"))
-        pedido = extrair_numero_pedido(conta)
-
-        print(
-            "FILTRO_CONTA:",
-            conta.get("id"),
-            "pedido=", pedido,
-            "situacao=", conta.get("situacao"),
-            "linkBoleto=", (detalhe or {}).get("linkBoleto", ""),
-            "saldo=", (detalhe or {}).get("saldo", ""),
-            "historico=", (detalhe or {}).get("historico", "")
-        )
-
-        if numero_pedido and pedido != numero_pedido:
-            continue
-
+        detalhe = buscar_conta_receber_detalhe(conta["id"])
         if not detalhe:
             continue
 
-        if not conta_em_aberto(conta):
-            continue
-
-        if not conta_e_boleto(detalhe):
-            continue
-
         conta["_detalhe"] = detalhe
-        conta["_pedido_numero"] = pedido
-        boletos.append(conta)
 
-    return boletos
+        if pedido and not conta_pertence_ao_pedido(conta, pedido):
+            continue
 
+        if boleto_valido(conta):
+            conta["_pedido_numero"] = str(((conta.get("origem") or {}).get("numero") or "")).strip()
+            boletos_validos.append(conta)
 
-def buscar_boletos_completo(contato_id, cpf_cnpj, numero_pedido=None):
-    resp1 = buscar_contas_por_contato_id(contato_id)
-    if not resp1["ok"]:
-        return {"ok": False, "erro": "falha_consulta"}
-
-    resp2 = buscar_contas_por_documento(cpf_cnpj)
-    if not resp2["ok"]:
-        return {"ok": False, "erro": "falha_consulta"}
-
-    contas = resp1["contas"] + resp2["contas"]
-
-    if numero_pedido:
-        resp3 = buscar_contas_por_numero_pedido(numero_pedido)
-        if not resp3["ok"]:
-            return {"ok": False, "erro": "falha_consulta"}
-        contas += resp3["contas"]
-
-    contas = deduplicar_contas(contas)
-    print("TOTAL_CONTAS_COMBINADAS:", len(contas))
-
-    boletos = filtrar_boletos(contas, numero_pedido=numero_pedido)
-    return {"ok": True, "boletos": boletos}
+    boletos_validos = ordenar_boletos(boletos_validos)
+    return {"ok": True, "boletos": boletos_validos}
 
 
-def agrupar_boletos_por_pedido(lista):
-    pedidos = {}
+# =========================
+# FORMATADORES
+# =========================
+def formatar_valor(valor):
+    try:
+        return f"R$ {float(valor):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        return f"R$ {valor}"
 
-    for b in lista:
-        pedido = str(b.get("_pedido_numero") or "Sem pedido").strip()
-        pedidos.setdefault(pedido, []).append(b)
 
-    return pedidos
+def montar_lista_boletos(boletos: list) -> str:
+    linhas = ["Encontrei os seguintes boletos:\n"]
+    for i, b in enumerate(boletos, start=1):
+        linhas.append(
+            f"{i}️⃣ {formatar_valor(b.get('valor'))} - vence {b.get('vencimento')} - situação {b.get('situacao')}"
+        )
+    linhas.append("\nDigite o número ou TODOS.")
+    return "\n".join(linhas)
 
 
-# =====================================================
-# API
-# =====================================================
-
+# =========================
+# WEBHOOK
+# =========================
 @app.get("/")
-def home():
-    return {"status": "online"}
+def root():
+    return {"ok": True, "app": "boleto-webhook"}
 
 
 @app.post("/webhook/digisac")
 async def webhook(request: Request):
-    body = await request.json()
-    print("Webhook recebido:", body)
+    payload = await request.json()
+    print("Webhook recebido:", payload)
 
-    data = body.get("data", {})
+    if not eh_mensagem_cliente(payload):
+        return {"ok": True, "ignorado": True}
 
-    message_id = data.get("id")
-    contact_id = data.get("contactId")
-    is_from_me = data.get("isFromMe", True)
-    message_type = data.get("type")
+    ticket_id = extrair_ticket_id(payload)
+    contact_id = extrair_contact_id(payload)
+    texto = extrair_texto(payload).strip()
 
-    mensagem_original = str(data.get("text", "")).strip()
-    mensagem = mensagem_original.lower()
-    comando = data.get("command") or mensagem_original
+    if not ticket_id or not contact_id:
+        return {"ok": False, "erro": "ticket_ou_contact_ausente"}
 
-    if message_id in mensagens_processadas:
-        return {"status": "ok"}
+    estado = obter_estado(ticket_id)
+    texto_limpo = texto_normalizado(texto)
+    numeros = so_numeros(texto)
 
-    if message_id:
-        mensagens_processadas.add(message_id)
-
-    if len(mensagens_processadas) > 5000:
-        mensagens_processadas.clear()
-
-    if not contact_id or is_from_me:
-        return {"status": "ok"}
-
-    if message_type != "chat":
-        return {"status": "ok"}
-
-    if not mensagem_original:
-        return {"status": "ok"}
-
-    estado = usuarios.get(contact_id, {}).get("estado")
-
-    if mensagem == "teste boleto":
-        usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
+    # =====================
+    # INÍCIO DO FLUXO
+    # =====================
+    if texto_limpo == "teste boleto":
+        limpar_estado(ticket_id)
+        estado = obter_estado(ticket_id)
+        estado["etapa"] = "aguardando_documento"
         enviar_mensagem(contact_id, "Digite seu CPF ou CNPJ para localizar seus boletos.")
-        return {"status": "ok"}
+        return {"ok": True}
 
-    if comando == "SEGUNDA_VIA":
-        usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
-        enviar_mensagem(contact_id, "Digite seu CPF ou CNPJ para localizar seus boletos.")
-        return {"status": "ok"}
+    # =====================
+    # CPF / CNPJ
+    # =====================
+    if estado["etapa"] in ("aguardando_documento", "idle"):
+        if len(numeros) not in (11, 14):
+            enviar_mensagem(contact_id, "CPF ou CNPJ inválido. Digite apenas números.")
+            return {"ok": True}
 
-    if estado == "AGUARDANDO_CPF":
-        cpf = limpar_documento(mensagem)
+        resp_contato = buscar_contato_por_documento(numeros)
+        print("RESPOSTA_CONTATO_DEBUG:", resp_contato)
 
-        if len(cpf) not in (11, 14):
-            enviar_mensagem(contact_id, "CPF ou CNPJ inválido.")
-            return {"status": "ok"}
+        if not resp_contato["ok"]:
+            enviar_mensagem(contact_id, "Não localizei cadastro para esse CPF/CNPJ.")
+            return {"ok": True}
 
-        usuarios[contact_id] = {
-            "estado": "AGUARDANDO_MODO_BUSCA",
-            "cpf": cpf
-        }
+        estado["cpf_cnpj"] = numeros
+        estado["contato_bling"] = resp_contato["contato"]
+        estado["etapa"] = "aguardando_modo_consulta"
 
         enviar_mensagem(
             contact_id,
-            "Como deseja consultar?\n\n"
-            "1️⃣ Pedido específico\n"
-            "2️⃣ Todos os boletos"
+            "Como deseja consultar?\n\n1️⃣ Pedido específico\n2️⃣ Todos os boletos"
         )
-        return {"status": "ok"}
+        return {"ok": True}
 
-    if estado == "AGUARDANDO_MODO_BUSCA":
-        if mensagem == "1":
-            usuarios[contact_id]["estado"] = "AGUARDANDO_NUMERO_PEDIDO"
+    # =====================
+    # ESCOLHA DO MODO
+    # =====================
+    if estado["etapa"] == "aguardando_modo_consulta":
+        if texto_limpo == "1":
+            estado["modo_consulta"] = "pedido"
+            estado["etapa"] = "aguardando_numero_pedido"
             enviar_mensagem(contact_id, "Digite o número do pedido.")
-            return {"status": "ok"}
+            return {"ok": True}
 
-        if mensagem == "2":
-            cpf = usuarios[contact_id]["cpf"]
+        if texto_limpo == "2":
+            estado["modo_consulta"] = "todos"
+            estado["etapa"] = "consultando_todos"
 
             enviar_mensagem(contact_id, "Buscando seus boletos... 🔍")
 
-            resp_contato = buscar_contato_por_documento(cpf)
-            print("RESPOSTA_CONTATO_DEBUG:", resp_contato)
-
-            if not resp_contato["ok"]:
-                enviar_mensagem(contact_id, "Estou com instabilidade na consulta agora. Tente novamente em instantes.")
-                usuarios.pop(contact_id, None)
-                return {"status": "ok"}
-
-            contato = resp_contato["contato"]
-
-            if not contato:
-                enviar_mensagem(contact_id, "Cadastro não localizado para esse CPF/CNPJ.")
-                usuarios.pop(contact_id, None)
-                return {"status": "ok"}
-
-            print(
-                "CONTATO_ENCONTRADO_ID:",
-                contato.get("id"),
-                contato.get("nome"),
-                contato.get("numeroDocumento")
-            )
-
-            resp_boletos = buscar_boletos_completo(contato["id"], cpf)
+            contato = estado["contato_bling"]
+            resp_boletos = buscar_boletos_por_contato(contato["id"])
             print("RESPOSTA_BOLETOS_DEBUG:", resp_boletos)
 
             if not resp_boletos["ok"]:
                 enviar_mensagem(contact_id, "Erro ao consultar boletos.")
-                usuarios.pop(contact_id, None)
-                return {"status": "ok"}
+                return {"ok": True}
 
             boletos = resp_boletos["boletos"]
-
             if not boletos:
                 enviar_mensagem(contact_id, "Não encontrei boletos em aberto ou em atraso para esse cadastro.")
-                usuarios.pop(contact_id, None)
-                return {"status": "ok"}
+                limpar_estado(ticket_id)
+                return {"ok": True}
 
-            pedidos = agrupar_boletos_por_pedido(boletos)
+            estado["boletos"] = boletos
+            estado["etapa"] = "aguardando_escolha_boleto"
+            enviar_mensagem(contact_id, montar_lista_boletos(boletos))
+            return {"ok": True}
 
-            texto = "Encontrei os seguintes pedidos:\n\n"
-            mapa = {}
+        enviar_mensagem(contact_id, "Digite 1 para pedido específico ou 2 para todos os boletos.")
+        return {"ok": True}
 
-            for i, (pedido, lista) in enumerate(pedidos.items(), start=1):
-                texto += f"{i}️⃣ Pedido {pedido} ({len(lista)} parcelas)\n"
-                mapa[str(i)] = pedido
+    # =====================
+    # NÚMERO DO PEDIDO
+    # =====================
+    if estado["etapa"] == "aguardando_numero_pedido":
+        if not numeros:
+            enviar_mensagem(contact_id, "Digite apenas o número do pedido.")
+            return {"ok": True}
 
-            texto += "\nDigite o número desejado."
-
-            usuarios[contact_id] = {
-                "estado": "AGUARDANDO_PEDIDO",
-                "pedidos": pedidos,
-                "mapa_pedidos": mapa
-            }
-
-            enviar_mensagem(contact_id, texto)
-            return {"status": "ok"}
-
-        enviar_mensagem(contact_id, "Digite 1 ou 2.")
-        return {"status": "ok"}
-
-    if estado == "AGUARDANDO_NUMERO_PEDIDO":
-        numero_pedido = mensagem.strip()
-        cpf = usuarios[contact_id]["cpf"]
+        estado["pedido"] = numeros
+        estado["etapa"] = "consultando_pedido"
 
         enviar_mensagem(contact_id, "Buscando seu pedido... 🔍")
 
-        resp_contato = buscar_contato_por_documento(cpf)
-        print("RESPOSTA_CONTATO_DEBUG:", resp_contato)
-
-        if not resp_contato["ok"]:
-            enviar_mensagem(contact_id, "Erro ao consultar cadastro.")
-            usuarios.pop(contact_id, None)
-            return {"status": "ok"}
-
-        contato = resp_contato["contato"]
-
-        if not contato:
-            enviar_mensagem(contact_id, "Cadastro não localizado para esse CPF/CNPJ.")
-            usuarios.pop(contact_id, None)
-            return {"status": "ok"}
-
-        resp_boletos = buscar_boletos_completo(
-            contato["id"],
-            cpf,
-            numero_pedido=numero_pedido
-        )
+        contato = estado["contato_bling"]
+        resp_boletos = buscar_boletos_por_contato(contato["id"], pedido=numeros)
         print("RESPOSTA_BOLETOS_DEBUG:", resp_boletos)
 
         if not resp_boletos["ok"]:
             enviar_mensagem(contact_id, "Erro ao consultar boletos.")
-            usuarios.pop(contact_id, None)
-            return {"status": "ok"}
+            return {"ok": True}
 
         boletos = resp_boletos["boletos"]
-
         if not boletos:
             enviar_mensagem(contact_id, "Não encontrei boleto para esse pedido.")
-            usuarios.pop(contact_id, None)
-            return {"status": "ok"}
+            limpar_estado(ticket_id)
+            return {"ok": True}
 
-        texto = "Encontrei os seguintes boletos:\n\n"
-        mapa_boletos = {}
+        estado["boletos"] = boletos
+        estado["etapa"] = "aguardando_escolha_boleto"
+        enviar_mensagem(contact_id, montar_lista_boletos(boletos))
+        return {"ok": True}
 
-        for i, b in enumerate(boletos, start=1):
-            valor = formatar_valor(b.get("valor", 0))
-            venc = b.get("vencimento") or b.get("dataVencimento") or "-"
-            situacao = b.get("situacao", "-")
-            texto += f"{i}️⃣ R$ {valor} - vence {venc} - situação {situacao}\n"
-            mapa_boletos[str(i)] = b
+    # =====================
+    # ESCOLHA DE BOLETO
+    # =====================
+    if estado["etapa"] == "aguardando_escolha_boleto":
+        boletos = estado.get("boletos", [])
 
-        texto += "\nDigite o número ou TODOS."
-
-        usuarios[contact_id] = {
-            "estado": "AGUARDANDO_BOLETO",
-            "mapa_boletos": mapa_boletos
-        }
-
-        enviar_mensagem(contact_id, texto)
-        return {"status": "ok"}
-
-    if estado == "AGUARDANDO_PEDIDO":
-        mapa = usuarios[contact_id]["mapa_pedidos"]
-        pedido = mapa.get(mensagem)
-
-        if not pedido:
-            enviar_mensagem(contact_id, "Opção inválida.")
-            return {"status": "ok"}
-
-        boletos = usuarios[contact_id]["pedidos"][pedido]
-
-        texto = "Boletos disponíveis:\n\n"
-        mapa_boletos = {}
-
-        for i, b in enumerate(boletos, start=1):
-            valor = formatar_valor(b.get("valor", 0))
-            venc = b.get("vencimento") or b.get("dataVencimento") or "-"
-            situacao = b.get("situacao", "-")
-
-            texto += f"{i}️⃣ R$ {valor} - vence {venc} - situação {situacao}\n"
-            mapa_boletos[str(i)] = b
-
-        texto += "\nDigite o número ou TODOS."
-
-        usuarios[contact_id]["estado"] = "AGUARDANDO_BOLETO"
-        usuarios[contact_id]["mapa_boletos"] = mapa_boletos
-
-        enviar_mensagem(contact_id, texto)
-        return {"status": "ok"}
-
-    if estado == "AGUARDANDO_BOLETO":
-        mapa = usuarios[contact_id]["mapa_boletos"]
-
-        if mensagem == "todos":
+        if texto_limpo == "todos":
             enviados = 0
-
-            for boleto in mapa.values():
-                link = buscar_link_boleto_do_item(boleto)
-
+            for boleto in boletos:
+                link = boleto.get("linkBoleto") or (boleto.get("_detalhe") or {}).get("linkBoleto")
                 if link:
                     enviar_documento(contact_id, link)
                     enviados += 1
 
             if enviados == 0:
                 enviar_mensagem(contact_id, "Não consegui obter os boletos.")
-                return {"status": "ok"}
+                limpar_estado(ticket_id)
+                return {"ok": True}
 
-        elif mensagem in mapa:
-            boleto = mapa[mensagem]
-            link = buscar_link_boleto_do_item(boleto)
+            estado["etapa"] = "aguardando_encerramento"
+            enviar_mensagem(contact_id, "Posso encerrar o atendimento?\n\n1️⃣ Sim\n2️⃣ Não")
+            return {"ok": True}
 
-            if not link:
-                enviar_mensagem(contact_id, "Não consegui obter esse boleto.")
-                return {"status": "ok"}
+        if not numeros:
+            enviar_mensagem(contact_id, "Digite o número do boleto desejado ou TODOS.")
+            return {"ok": True}
 
-            enviar_documento(contact_id, link)
+        indice = int(numeros) - 1
+        if indice < 0 or indice >= len(boletos):
+            enviar_mensagem(contact_id, "Número inválido. Escolha uma opção da lista.")
+            return {"ok": True}
 
-        else:
-            enviar_mensagem(contact_id, "Opção inválida.")
-            return {"status": "ok"}
+        boleto = boletos[indice]
+        link = boleto.get("linkBoleto") or (boleto.get("_detalhe") or {}).get("linkBoleto")
 
-        usuarios[contact_id]["estado"] = "FINALIZANDO"
+        if not link:
+            enviar_mensagem(contact_id, "Não consegui obter esse boleto.")
+            limpar_estado(ticket_id)
+            return {"ok": True}
 
-        enviar_mensagem(
-            contact_id,
-            "Posso encerrar o atendimento?\n\n1️⃣ Sim\n2️⃣ Não"
-        )
-        return {"status": "ok"}
+        enviar_documento(contact_id, link)
+        estado["etapa"] = "aguardando_encerramento"
+        enviar_mensagem(contact_id, "Posso encerrar o atendimento?\n\n1️⃣ Sim\n2️⃣ Não")
+        return {"ok": True}
 
-    if estado == "FINALIZANDO":
-        if mensagem == "1":
-            enviar_mensagem(contact_id, "Atendimento encerrado ✅")
-            usuarios.pop(contact_id, None)
+    # =====================
+    # ENCERRAMENTO
+    # =====================
+    if estado["etapa"] == "aguardando_encerramento":
+        if texto_limpo == "1":
+            enviar_mensagem(contact_id, "Atendimento encerrado. Obrigado!")
+            limpar_estado(ticket_id)
+            return {"ok": True}
 
-        elif mensagem == "2":
-            enviar_mensagem(contact_id, "Vou transferir para o financeiro 👨‍💼")
-            usuarios.pop(contact_id, None)
+        if texto_limpo == "2":
+            enviar_mensagem(contact_id, "Certo. Se precisar de mais alguma coisa, é só me chamar.")
+            limpar_estado(ticket_id)
+            return {"ok": True}
 
-        else:
-            enviar_mensagem(contact_id, "Digite 1 ou 2.")
+        enviar_mensagem(contact_id, "Digite 1 para Sim ou 2 para Não.")
+        return {"ok": True}
 
-        return {"status": "ok"}
-
-    return {"status": "ok"}
+    return {"ok": True}
