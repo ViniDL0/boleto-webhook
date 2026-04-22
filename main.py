@@ -325,8 +325,22 @@ def buscar_contas_por_numero_pedido(numero_pedido):
             break
 
         for conta in dados:
-            pedido = extrair_numero_pedido(conta)
+            origem = conta.get("origem", {}) or {}
+            pedido = str(origem.get("numero", "")).strip()
+
+            if pedido:
+                print(
+                    "PEDIDO_ENCONTRADO_NA_VARREDURA:",
+                    "pagina=", pagina,
+                    "conta_id=", conta.get("id"),
+                    "pedido=", pedido,
+                    "contato_id=", (conta.get("contato") or {}).get("id"),
+                    "documento=", (conta.get("contato") or {}).get("numeroDocumento"),
+                    "situacao=", conta.get("situacao")
+                )
+
             if pedido == numero_pedido:
+                print("MATCH_PEDIDO:", conta)
                 contas.append(conta)
 
         if len(dados) < 100:
