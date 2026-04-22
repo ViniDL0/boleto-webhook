@@ -189,6 +189,20 @@ def deduplicar_contas(contas):
     return list(unicas.values())
 
 
+def buscar_link_boleto_do_item(boleto):
+    detalhe = boleto.get("_detalhe", {}) or {}
+    link = str(detalhe.get("linkBoleto", "") or "").strip()
+
+    if link:
+        return link
+
+    link = str(boleto.get("linkBoleto", "") or "").strip()
+    if link:
+        return link
+
+    return None
+
+
 # =====================================================
 # BUSCA CONTATO
 # =====================================================
@@ -435,26 +449,6 @@ def agrupar_boletos_por_pedido(lista):
     return pedidos
 
 
-def buscar_link_boleto_por_conta(id_conta):
-    resp = bling_get(f"/contas/receber/{id_conta}/boleto")
-    print("Bling boleto:", resp.status_code, id_conta, resp.text)
-
-    if resp.status_code != 200:
-        return None
-
-    data = resp.json().get("data", {})
-
-    if not isinstance(data, dict):
-        return None
-
-    return (
-        data.get("link")
-        or data.get("url")
-        or data.get("linkBoleto")
-        or data.get("boleto")
-    )
-
-
 # =====================================================
 # API
 # =====================================================
@@ -697,11 +691,7 @@ async def webhook(request: Request):
             enviados = 0
 
             for boleto in mapa.values():
-                id_conta = boleto.get("id")
-                if not id_conta:
-                    continue
-
-                link = buscar_link_boleto_por_conta(id_conta)
+                link = buscar_link_boleto_do_item(boleto)
 
                 if link:
                     enviar_documento(contact_id, link)
@@ -713,13 +703,7 @@ async def webhook(request: Request):
 
         elif mensagem in mapa:
             boleto = mapa[mensagem]
-            id_conta = boleto.get("id")
-
-            if not id_conta:
-                enviar_mensagem(contact_id, "Não encontrei o identificador do boleto.")
-                return {"status": "ok"}
-
-            link = buscar_link_boleto_por_conta(id_conta)
+            link = buscar_link_boleto_do_item(boleto)
 
             if not link:
                 enviar_mensagem(contact_id, "Não consegui obter esse boleto.")
