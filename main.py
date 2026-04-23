@@ -67,7 +67,7 @@ def enviar_mensagem(contact_id, texto):
     return resp
 
 
-def enviar_documento(contact_id, url_pdf, filename="boleto.pdf"):
+def enviar_documento(ticket_id, contact_id, service_id, url_pdf, filename="boleto.pdf"):
     url = f"{DIGISAC_BASE_URL}/messages"
 
     headers = {
@@ -76,7 +76,9 @@ def enviar_documento(contact_id, url_pdf, filename="boleto.pdf"):
     }
 
     body = {
+        "ticketId": ticket_id,
         "contactId": contact_id,
+        "serviceId": service_id,
         "type": "file",
         "file": {
             "url": url_pdf,
@@ -85,6 +87,7 @@ def enviar_documento(contact_id, url_pdf, filename="boleto.pdf"):
     }
 
     resp = requests.post(url, json=body, headers=headers, timeout=30)
+    print("DIGISAC_ENVIO_DOCUMENTO_PAYLOAD:", body)
     print("Digisac documento:", resp.status_code, resp.text)
     return resp
 
@@ -688,18 +691,40 @@ async def webhook(request: Request):
     if estado == "AGUARDANDO_BOLETO":
         mapa = usuarios[contact_id]["mapa_boletos"]
 
+        ticket_id = data.get("ticketId")
+        service_id = data.get("serviceId")
+
         if mensagem == "todos":
             enviados = 0
 
-            for boleto in mapa.values():
+            for idx, boleto in mapa.items():
                 link = buscar_link_boleto_do_item(boleto)
 
-                if link:
-                    enviar_documento(contact_id, link)
+                if not link:
+                    print(f"BOLETO_SEM_LINK: opcao={idx} id={boleto.get('id')}")
+                    continue
+
+                nome_arquivo = f"boleto_{boleto.get('id', idx)}.pdf"
+
+                resp_doc = enviar_documento(
+                    ticket_id=ticket_id,
+                    contact_id=contact_id,
+                    service_id=service_id,
+                    url_pdf=link,
+                    filename=nome_arquivo
+                )
+
+                if resp_doc.status_code in (200, 201):
                     enviados += 1
+                else:
+                    print(
+                        "ERRO_ENVIO_DOCUMENTO:",
+                        resp_doc.status_code,
+                        resp_doc.text
+                    )
 
             if enviados == 0:
-                enviar_mensagem(contact_id, "Não consegui obter os boletos.")
+                enviar_mensagem(contact_id, "Não consegui enviar os boletos.")
                 return {"status": "ok"}
 
             usuarios[contact_id]["estado"] = "AGUARDANDO_ENCERRAR"
@@ -717,7 +742,20 @@ async def webhook(request: Request):
                 enviar_mensagem(contact_id, "Não consegui obter esse boleto.")
                 return {"status": "ok"}
 
-            enviar_documento(contact_id, link)
+            nome_arquivo = f"boleto_{boleto.get('id', mensagem)}.pdf"
+
+            resp_doc = enviar_documento(
+                ticket_id=ticket_id,
+                contact_id=contact_id,
+                service_id=service_id,
+                url_pdf=link,
+                filename=nome_arquivo
+            )
+
+            if resp_doc.status_code not in (200, 201):
+                print("ERRO_ENVIO_DOCUMENTO:", resp_doc.status_code, resp_doc.text)
+                enviar_mensagem(contact_id, "Não consegui enviar esse boleto.")
+                return {"status": "ok"}
 
             usuarios[contact_id]["estado"] = "AGUARDANDO_ENCERRAR"
             enviar_mensagem(
@@ -730,7 +768,7 @@ async def webhook(request: Request):
             enviar_mensagem(contact_id, "Opção inválida. Digite o número do boleto ou TODOS.")
             return {"status": "ok"}
 
-    if estado == "FINALIZANDO":
+    if estado == "AGUARDANDO_ENCERRAR":
         if mensagem == "1":
             enviar_mensagem(contact_id, "Atendimento encerrado ✅")
             usuarios.pop(contact_id, None)
@@ -743,5 +781,3 @@ async def webhook(request: Request):
             enviar_mensagem(contact_id, "Digite 1 ou 2.")
 
         return {"status": "ok"}
-
-    return {"status": "ok"}
