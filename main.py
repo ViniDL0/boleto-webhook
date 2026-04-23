@@ -695,12 +695,19 @@ async def webhook(request: Request):
                 link = buscar_link_boleto_do_item(boleto)
 
                 if link:
-                    enviar_documento(contact_id, link, "boleto.pdf")
+                    enviar_documento(contact_id, link)
                     enviados += 1
 
             if enviados == 0:
                 enviar_mensagem(contact_id, "Não consegui obter os boletos.")
                 return {"status": "ok"}
+
+            usuarios[contact_id]["estado"] = "AGUARDANDO_ENCERRAR"
+            enviar_mensagem(
+                contact_id,
+                "Posso encerrar o atendimento?\n\n1️⃣ Sim\n2️⃣ Não"
+            )
+            return {"status": "ok"}
 
         elif mensagem in mapa:
             boleto = mapa[mensagem]
@@ -710,19 +717,18 @@ async def webhook(request: Request):
                 enviar_mensagem(contact_id, "Não consegui obter esse boleto.")
                 return {"status": "ok"}
 
-            enviar_documento(contact_id, link, "boleto.pdf")
+            enviar_documento(contact_id, link)
 
-        else:
-            enviar_mensagem(contact_id, "Opção inválida.")
+            usuarios[contact_id]["estado"] = "AGUARDANDO_ENCERRAR"
+            enviar_mensagem(
+                contact_id,
+                "Posso encerrar o atendimento?\n\n1️⃣ Sim\n2️⃣ Não"
+            )
             return {"status": "ok"}
 
-        usuarios[contact_id]["estado"] = "FINALIZANDO"
-
-        enviar_mensagem(
-            contact_id,
-            "Posso encerrar o atendimento?\n\n1️⃣ Sim\n2️⃣ Não"
-        )
-        return {"status": "ok"}
+        else:
+            enviar_mensagem(contact_id, "Opção inválida. Digite o número do boleto ou TODOS.")
+            return {"status": "ok"}
 
     if estado == "FINALIZANDO":
         if mensagem == "1":
