@@ -67,7 +67,7 @@ def enviar_mensagem(contact_id, texto):
     return resp
 
 
-def enviar_documento(ticket_id, contact_id, service_id, url_pdf, filename="boleto.pdf"):
+def enviar_documento(contact_id, url_pdf, filename="boleto.pdf"):
     url = f"{DIGISAC_BASE_URL}/messages"
 
     headers = {
@@ -76,9 +76,7 @@ def enviar_documento(ticket_id, contact_id, service_id, url_pdf, filename="bolet
     }
 
     body = {
-        "ticketId": ticket_id,
         "contactId": contact_id,
-        "serviceId": service_id,
         "type": "file",
         "file": {
             "url": url_pdf,
@@ -691,9 +689,6 @@ async def webhook(request: Request):
     if estado == "AGUARDANDO_BOLETO":
         mapa = usuarios[contact_id]["mapa_boletos"]
 
-        ticket_id = data.get("ticketId")
-        service_id = data.get("serviceId")
-
         if mensagem == "todos":
             enviados = 0
 
@@ -707,9 +702,7 @@ async def webhook(request: Request):
                 nome_arquivo = f"boleto_{boleto.get('id', idx)}.pdf"
 
                 resp_doc = enviar_documento(
-                    ticket_id=ticket_id,
                     contact_id=contact_id,
-                    service_id=service_id,
                     url_pdf=link,
                     filename=nome_arquivo
                 )
@@ -717,11 +710,7 @@ async def webhook(request: Request):
                 if resp_doc.status_code in (200, 201):
                     enviados += 1
                 else:
-                    print(
-                        "ERRO_ENVIO_DOCUMENTO:",
-                        resp_doc.status_code,
-                        resp_doc.text
-                    )
+                    print("ERRO_ENVIO_DOCUMENTO:", resp_doc.status_code, resp_doc.text)
 
             if enviados == 0:
                 enviar_mensagem(contact_id, "Não consegui enviar os boletos.")
@@ -745,9 +734,7 @@ async def webhook(request: Request):
             nome_arquivo = f"boleto_{boleto.get('id', mensagem)}.pdf"
 
             resp_doc = enviar_documento(
-                ticket_id=ticket_id,
                 contact_id=contact_id,
-                service_id=service_id,
                 url_pdf=link,
                 filename=nome_arquivo
             )
