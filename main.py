@@ -836,6 +836,25 @@ async def webhook(request: Request):
             usuarios.pop(contact_id, None)
 
         elif mensagem == "2":
+            enviar_mensagem(
+                contact_id,
+                "Como deseja continuar?\n\n1️⃣ Solicitar 2ª via de outro boleto\n2️⃣ Falar com atendente"
+            )
+            usuarios[contact_id]["estado"] = "AGUARDANDO_CONTINUAR"
+
+        else:
+            enviar_mensagem(contact_id, "Digite 1 ou 2.")
+
+        return {"status": "ok"}
+
+
+    if estado == "AGUARDANDO_CONTINUAR":
+
+        if mensagem == "1":
+            usuarios[contact_id] = {"estado": "AGUARDANDO_DOCUMENTO"}
+            enviar_mensagem(contact_id, "Digite seu CPF ou CNPJ para localizar seus boletos.")
+
+        elif mensagem == "2":
             enviar_mensagem(contact_id, "Vou transferir para o financeiro 👨‍💼")
 
             transferir_chamado(
@@ -848,8 +867,12 @@ async def webhook(request: Request):
             usuarios.pop(contact_id, None)
 
         else:
-            enviar_mensagem(contact_id, "Digite 1 ou 2.")
+            enviar_mensagem(
+                contact_id,
+                "Digite 1 ou 2.\n\n1️⃣ Solicitar 2ª via de outro boleto\n2️⃣ Falar com atendente"
+            )
 
         return {"status": "ok"}
+
 
     return {"status": "ok"}
