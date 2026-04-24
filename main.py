@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 import requests
 import time
 import base64
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 
 from auth_bling import obter_access_token, forcar_refresh
@@ -97,28 +97,28 @@ def enviar_mensagem(contact_id, texto):
     return resp
 
 
-def gerar_pdf_base64_do_link(url_boleto):
+async def gerar_pdf_base64_do_link(url_boleto):
     """
     Abre o link HTML do boleto em um navegador headless e salva a página como PDF.
     Isso resolve o caso do Bling retornar text/html em vez de application/pdf.
     """
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
 
             print("PLAYWRIGHT_ABRINDO_BOLETO:", url_boleto)
 
-            page.goto(
+            await page.goto(
                 url_boleto,
                 wait_until="networkidle",
                 timeout=60000
             )
 
             # Pequena espera extra para renderizar conteúdo que carregue após a página.
-            page.wait_for_timeout(1500)
+            await page.wait_for_timeout(1500)
 
-            pdf_bytes = page.pdf(
+            pdf_bytes = await page.pdf(
                 format="A4",
                 print_background=True,
                 margin={
@@ -129,7 +129,7 @@ def gerar_pdf_base64_do_link(url_boleto):
                 }
             )
 
-            browser.close()
+            await browser.close()
 
         if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
             print("ERRO_GERAR_PDF: conteúdo gerado não parece PDF")
@@ -143,7 +143,7 @@ def gerar_pdf_base64_do_link(url_boleto):
         return None
 
 
-def enviar_documento(numero_contato, service_id, url_pdf, filename="boleto.pdf", texto=""):
+async def enviar_documento(numero_contato, service_id, url_pdf, filename="boleto.pdf", texto=""):
     url = f"{DIGISAC_BASE_URL}/messages"
 
     headers = {
@@ -159,7 +159,7 @@ def enviar_documento(numero_contato, service_id, url_pdf, filename="boleto.pdf",
         print("ERRO_ENVIO_DOCUMENTO: service_id vazio")
         return None
 
-    pdf_base64 = gerar_pdf_base64_do_link(url_pdf)
+    pdf_base64 = await gerar_pdf_base64_do_link(url_pdf)
 
     if not pdf_base64:
         print("ERRO_ENVIO_DOCUMENTO: falha ao gerar PDF base64")
@@ -828,7 +828,7 @@ async def webhook(request: Request):
 
                 nome_arquivo = f"boleto_{boleto.get('id', idx)}.pdf"
 
-                resp_doc = enviar_documento(
+                resp_doc = await enviar_documento(
                     numero_contato=numero_contato_estado,
                     service_id=service_id_estado,
                     url_pdf=link,
@@ -864,7 +864,7 @@ async def webhook(request: Request):
 
             nome_arquivo = f"boleto_{boleto.get('id', mensagem)}.pdf"
 
-            resp_doc = enviar_documento(
+            resp_doc = await enviar_documento(
                 numero_contato=numero_contato_estado,
                 service_id=service_id_estado,
                 url_pdf=link,
