@@ -2,7 +2,7 @@ from fastapi import FastAPI, Request
 import requests
 import time
 from auth_bling import obter_access_token, forcar_refresh
-from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL
+from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL, DIGISAC_DEPARTMENT_ID_FINANCEIRO, DIGISAC_USER_ID_FINANCEIRO
 
 app = FastAPI()
 
@@ -90,6 +90,25 @@ def enviar_mensagem(contact_id, texto):
 
     resp = requests.post(url, json=body, headers=headers, timeout=30)
     print("Digisac mensagem:", resp.status_code, resp.text)
+    return resp
+
+
+
+
+def transferir_chamado(contact_id, department_id, user_id="", comments="Transferido automaticamente pelo bot."):
+    url = f"{DIGISAC_BASE_URL}/contacts/{contact_id}/ticket/transfer"
+    headers = {
+        "Authorization": f"Bearer {DIGISAC_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    body = {
+        "departmentId": department_id,
+        "comments": comments
+    }
+    if user_id:
+        body["userId"] = user_id
+    resp = requests.post(url, json=body, headers=headers, timeout=30)
+    print("Digisac transferência:", resp.status_code, resp.text)
     return resp
 
 
