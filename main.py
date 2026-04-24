@@ -1,10 +1,6 @@
 from fastapi import FastAPI, Request
 import requests
 import time
-import base64
-from playwright.async_api import async_playwright
-
-
 from auth_bling import obter_access_token, forcar_refresh
 from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL
 
@@ -97,100 +93,24 @@ def enviar_mensagem(contact_id, texto):
     return resp
 
 
-async def gerar_pdf_base64_do_link(url_boleto):
-    """
-    Abre o link HTML do boleto em um navegador headless e salva a página como PDF.
-    Isso resolve o caso do Bling retornar text/html em vez de application/pdf.
-    """
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
+def enviar_link_boleto(contact_id, link_boleto, boleto=None):
+    valor = formatar_valor((boleto or {}).get("valor", 0)) if boleto else ""
+    venc = (boleto or {}).get("vencimento") or (boleto or {}).get("dataVencimento") or ""
 
-            print("PLAYWRIGHT_ABRINDO_BOLETO:", url_boleto)
+    texto = "Segue o link do boleto solicitado:\n"
 
-            await page.goto(
-                url_boleto,
-                wait_until="networkidle",
-                timeout=60000
-            )
+    if valor or venc:
+        detalhes = []
+        if valor:
+            detalhes.append(f"Valor: R$ {valor}")
+        if venc:
+            detalhes.append(f"Vencimento: {venc}")
+        texto += " | ".join(detalhes) + "\n"
 
-            # Pequena espera extra para renderizar conteúdo que carregue após a página.
-            await page.wait_for_timeout(1500)
+    texto += str(link_boleto).strip()
 
-            pdf_bytes = await page.pdf(
-                format="A4",
-                print_background=True,
-                margin={
-                    "top": "10mm",
-                    "right": "10mm",
-                    "bottom": "10mm",
-                    "left": "10mm"
-                }
-            )
+    return enviar_mensagem(contact_id, texto)
 
-            await browser.close()
-
-        if not pdf_bytes or not pdf_bytes.startswith(b"%PDF"):
-            print("ERRO_GERAR_PDF: conteúdo gerado não parece PDF")
-            return None
-
-        print("PDF_GERADO_COM_SUCESSO:", len(pdf_bytes), "bytes")
-        return base64.b64encode(pdf_bytes).decode("utf-8")
-
-    except Exception as e:
-        print("ERRO_GERAR_PDF:", str(e))
-        return None
-
-
-async def enviar_documento(numero_contato, service_id, url_pdf, filename="boleto.pdf", texto=""):
-    url = f"{DIGISAC_BASE_URL}/messages"
-
-    headers = {
-        "Authorization": f"Bearer {DIGISAC_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    if not numero_contato:
-        print("ERRO_ENVIO_DOCUMENTO: numero_contato vazio")
-        return None
-
-    if not service_id:
-        print("ERRO_ENVIO_DOCUMENTO: service_id vazio")
-        return None
-
-    pdf_base64 = await gerar_pdf_base64_do_link(url_pdf)
-
-    if not pdf_base64:
-        print("ERRO_ENVIO_DOCUMENTO: falha ao gerar PDF base64")
-        return None
-
-    body = {
-        "text": texto or filename,
-        "number": str(numero_contato),
-        "serviceId": str(service_id),
-        "file": {
-            "base64": pdf_base64,
-            "mimetype": "application/pdf",
-            "name": filename
-        }
-    }
-
-    print("DIGISAC_ENVIO_DOCUMENTO_PAYLOAD:", {
-        "text": body["text"],
-        "number": body["number"],
-        "serviceId": body["serviceId"],
-        "file": {
-            "base64": f"<base64 com {len(pdf_base64)} chars>",
-            "mimetype": "application/pdf",
-            "name": filename
-        }
-    })
-
-    resp = requests.post(url, json=body, headers=headers, timeout=60)
-    print("Digisac documento:", resp.status_code, resp.text)
-
-    return resp
 
 # =====================================================
 # BLING
@@ -811,11 +731,6 @@ async def webhook(request: Request):
 
     if estado == "AGUARDANDO_BOLETO":
         mapa = usuarios[contact_id]["mapa_boletos"]
-        numero_contato_estado = usuarios[contact_id].get("numero_contato")
-        service_id_estado = usuarios[contact_id].get("service_id")
-
-        print("DEBUG_AGUARDANDO_BOLETO numero_contato=", numero_contato_estado, "service_id=", service_id_estado)
-
         if mensagem == "todos":
             enviados = 0
 
@@ -826,22 +741,15 @@ async def webhook(request: Request):
                     print(f"BOLETO_SEM_LINK: opcao={idx} id={boleto.get('id')}")
                     continue
 
-                nome_arquivo = f"boleto_{boleto.get('id', idx)}.pdf"
+                resp_link = enviar_link_boleto(contact_id, link, boleto=boleto)
 
-                resp_doc = await enviar_documento(
-                    numero_contato=numero_contato_estado,
-                    service_id=service_id_estado,
-                    url_pdf=link,
-                    filename=nome_arquivo
-                )
-
-                if resp_doc and resp_doc.status_code in (200, 201):
+                if resp_link and resp_link.status_code in (200, 201):
                     enviados += 1
                 else:
-                    if resp_doc is None:
-                        print("ERRO_ENVIO_DOCUMENTO: resposta None")
+                    if resp_link is None:
+                        print("ERRO_ENVIO_LINK: resposta None")
                     else:
-                        print("ERRO_ENVIO_DOCUMENTO:", resp_doc.status_code, resp_doc.text)
+                        print("ERRO_ENVIO_LINK:", resp_link.status_code, resp_link.text)
 
             if enviados == 0:
                 enviar_mensagem(contact_id, "Não consegui enviar os boletos.")
@@ -862,21 +770,14 @@ async def webhook(request: Request):
                 enviar_mensagem(contact_id, "Não consegui obter esse boleto.")
                 return {"status": "ok"}
 
-            nome_arquivo = f"boleto_{boleto.get('id', mensagem)}.pdf"
+            resp_link = enviar_link_boleto(contact_id, link, boleto=boleto)
 
-            resp_doc = await enviar_documento(
-                numero_contato=numero_contato_estado,
-                service_id=service_id_estado,
-                url_pdf=link,
-                filename=nome_arquivo
-            )
-
-            if not resp_doc or resp_doc.status_code not in (200, 201):
-                if resp_doc is None:
-                    print("ERRO_ENVIO_DOCUMENTO: resposta None")
+            if not resp_link or resp_link.status_code not in (200, 201):
+                if resp_link is None:
+                    print("ERRO_ENVIO_LINK: resposta None")
                 else:
-                    print("ERRO_ENVIO_DOCUMENTO:", resp_doc.status_code, resp_doc.text)
-                enviar_mensagem(contact_id, "Não consegui enviar esse boleto.")
+                    print("ERRO_ENVIO_LINK:", resp_link.status_code, resp_link.text)
+                enviar_mensagem(contact_id, "Não consegui enviar o link desse boleto.")
                 return {"status": "ok"}
 
             usuarios[contact_id]["estado"] = "AGUARDANDO_ENCERRAR"
