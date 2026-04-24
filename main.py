@@ -538,6 +538,27 @@ async def webhook(request: Request):
     mensagem = mensagem_original.lower()
     comando = data.get("command") or mensagem_original
 
+    comando_identificador = (
+        data.get("data", {}).get("commandIdentifier")
+        or data.get("commandIdentifier")
+        or data.get("identifier")
+        or comando
+    )
+
+    if comando_identificador == "segunda_via_boleto":
+        usuarios[contact_id] = {
+            "estado": "AGUARDANDO_DOCUMENTO",
+            "service_id": service_id,
+            "numero_contato": numero_contato
+        }
+
+        enviar_mensagem(
+            contact_id,
+            "Digite seu CPF ou CNPJ para localizar seus boletos."
+        )
+
+        return {"status": "ok"}
+
     if message_id in mensagens_processadas:
         return {"status": "ok"}
 
