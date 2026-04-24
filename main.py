@@ -545,7 +545,10 @@ async def webhook(request: Request):
         or comando
     )
 
-    if comando_identificador == "segunda_via_boleto":
+    if (
+        comando_identificador == "segunda_via_boleto"
+        or mensagem in ["2ª via de boletos"]
+    ):
         usuarios[contact_id] = {
             "estado": "AGUARDANDO_DOCUMENTO",
             "service_id": service_id,
