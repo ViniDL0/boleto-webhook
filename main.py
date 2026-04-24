@@ -550,7 +550,7 @@ async def webhook(request: Request):
         or mensagem in ["2ª via de boletos"]
     ):
         usuarios[contact_id] = {
-            "estado": "AGUARDANDO_DOCUMENTO",
+            "estado": "AGUARDANDO_CPF",
             "service_id": service_id,
             "numero_contato": numero_contato
         }
