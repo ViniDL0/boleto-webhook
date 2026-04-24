@@ -92,7 +92,18 @@ def enviar_mensagem(contact_id, texto):
     print("Digisac mensagem:", resp.status_code, resp.text)
     return resp
 
+def fechar_chamado(contact_id):
+    url = f"{DIGISAC_BASE_URL}/contacts/{contact_id}/ticket/close"
 
+    headers = {
+        "Authorization": f"Bearer {DIGISAC_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    resp = requests.post(url, headers=headers, timeout=30)
+
+    print("Digisac fechar chamado:", resp.status_code, resp.text)
+    return resp
 
 
 def transferir_chamado(contact_id, department_id, user_id="", comments="Transferido pelo bot"):
@@ -821,6 +832,7 @@ async def webhook(request: Request):
 
         if mensagem == "1":
             enviar_mensagem(contact_id, "Atendimento encerrado ✅")
+            fechar_chamado(contact_id)
             usuarios.pop(contact_id, None)
 
         elif mensagem == "2":
