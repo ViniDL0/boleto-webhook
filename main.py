@@ -95,20 +95,27 @@ def enviar_mensagem(contact_id, texto):
 
 
 
-def transferir_chamado(contact_id, department_id, user_id="", comments="Transferido automaticamente pelo bot."):
+def transferir_chamado(contact_id, department_id, user_id="", comments="Transferido pelo bot"):
     url = f"{DIGISAC_BASE_URL}/contacts/{contact_id}/ticket/transfer"
+
     headers = {
         "Authorization": f"Bearer {DIGISAC_TOKEN}",
         "Content-Type": "application/json"
     }
+
     body = {
         "departmentId": department_id,
         "comments": comments
     }
+
     if user_id:
         body["userId"] = user_id
+
     resp = requests.post(url, json=body, headers=headers, timeout=30)
+
+    print("DIGISAC_TRANSFERENCIA_PAYLOAD:", body)
     print("Digisac transferência:", resp.status_code, resp.text)
+
     return resp
 
 
@@ -811,12 +818,21 @@ async def webhook(request: Request):
             return {"status": "ok"}
 
     if estado == "AGUARDANDO_ENCERRAR":
+
         if mensagem == "1":
             enviar_mensagem(contact_id, "Atendimento encerrado ✅")
             usuarios.pop(contact_id, None)
 
         elif mensagem == "2":
             enviar_mensagem(contact_id, "Vou transferir para o financeiro 👨‍💼")
+
+            transferir_chamado(
+                contact_id=contact_id,
+                department_id=DIGISAC_DEPARTMENT_ID_FINANCEIRO,
+                user_id=DIGISAC_USER_ID_FINANCEIRO,
+                comments="Cliente solicitou atendimento humano após consulta de boleto."
+            )
+
             usuarios.pop(contact_id, None)
 
         else:
