@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 import requests
 import time
+import base64
 
 from auth_bling import obter_access_token, forcar_refresh
 from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL
@@ -44,6 +45,33 @@ def aguardar_limite_bling():
     ULTIMA_CHAMADA_BLING = time.time()
 
 
+def extrair_numero_contato_webhook(data):
+    """
+    Tenta descobrir o número do contato a partir do webhook.
+    Se não encontrar, faz fallback para fromId/contactId.
+    """
+    candidatos = [
+        data.get("number"),
+        data.get("fromNumber"),
+        data.get("remoteJid"),
+        data.get("phone"),
+        data.get("mobile"),
+        data.get("identifier"),
+        data.get("from"),
+        data.get("fromId"),
+        data.get("contactId"),
+    ]
+
+    for c in candidatos:
+        if c is None:
+            continue
+        valor = str(c).strip()
+        if valor:
+            return valor
+
+    return ""
+
+
 # =====================================================
 # DIGISAC
 # =====================================================
@@ -67,7 +95,7 @@ def enviar_mensagem(contact_id, texto):
     return resp
 
 
-def enviar_documento(contact_id, url_pdf, filename="boleto.pdf"):
+def enviar_documento(numero_contato, service_id, url_pdf, filename="boleto.pdf", texto=""):
     url = f"{DIGISAC_BASE_URL}/messages"
 
     headers = {
@@ -75,18 +103,58 @@ def enviar_documento(contact_id, url_pdf, filename="boleto.pdf"):
         "Content-Type": "application/json"
     }
 
+    if not numero_contato:
+        print("ERRO_ENVIO_DOCUMENTO: numero_contato vazio")
+        return None
+
+    if not service_id:
+        print("ERRO_ENVIO_DOCUMENTO: service_id vazio")
+        return None
+
+    # baixa o PDF do Bling
+    resp_pdf = requests.get(url_pdf, timeout=60)
+    print("DOWNLOAD_PDF:", resp_pdf.status_code, resp_pdf.headers.get("Content-Type"))
+
+    if resp_pdf.status_code != 200:
+        print("ERRO_DOWNLOAD_PDF:", resp_pdf.status_code, resp_pdf.text[:500])
+        return None
+
+    pdf_bytes = resp_pdf.content
+
+    # valida se parece PDF
+    content_type = (resp_pdf.headers.get("Content-Type") or "").lower()
+    if "pdf" not in content_type and not pdf_bytes.startswith(b"%PDF"):
+        print("ERRO: conteúdo baixado não parece ser PDF")
+        print(pdf_bytes[:200])
+        return None
+
+    pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
+
     body = {
-        "contactId": contact_id,
-        "type": "file",
+        "text": texto,
+        "number": str(numero_contato),
+        "serviceId": str(service_id),
         "file": {
-            "url": url_pdf,
+            "base64": pdf_base64,
+            "mimetype": "application/pdf",
             "name": filename
         }
     }
 
-    resp = requests.post(url, json=body, headers=headers, timeout=30)
-    print("DIGISAC_ENVIO_DOCUMENTO_PAYLOAD:", body)
+    resp = requests.post(url, json=body, headers=headers, timeout=60)
+
+    print("DIGISAC_ENVIO_DOCUMENTO_PAYLOAD:", {
+        "text": texto,
+        "number": str(numero_contato),
+        "serviceId": str(service_id),
+        "file": {
+            "base64": f"<base64 com {len(pdf_base64)} chars>",
+            "mimetype": "application/pdf",
+            "name": filename
+        }
+    })
     print("Digisac documento:", resp.status_code, resp.text)
+
     return resp
 
 
@@ -469,6 +537,9 @@ async def webhook(request: Request):
 
     message_id = data.get("id")
     contact_id = data.get("contactId")
+    service_id = data.get("serviceId")
+    numero_contato = extrair_numero_contato_webhook(data)
+
     is_from_me = data.get("isFromMe", True)
     message_type = data.get("type")
 
@@ -497,12 +568,20 @@ async def webhook(request: Request):
     estado = usuarios.get(contact_id, {}).get("estado")
 
     if mensagem == "teste boleto":
-        usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
+        usuarios[contact_id] = {
+            "estado": "AGUARDANDO_CPF",
+            "service_id": service_id,
+            "numero_contato": numero_contato
+        }
         enviar_mensagem(contact_id, "Digite seu CPF ou CNPJ para localizar seus boletos.")
         return {"status": "ok"}
 
     if comando == "SEGUNDA_VIA":
-        usuarios[contact_id] = {"estado": "AGUARDANDO_CPF"}
+        usuarios[contact_id] = {
+            "estado": "AGUARDANDO_CPF",
+            "service_id": service_id,
+            "numero_contato": numero_contato
+        }
         enviar_mensagem(contact_id, "Digite seu CPF ou CNPJ para localizar seus boletos.")
         return {"status": "ok"}
 
@@ -515,7 +594,9 @@ async def webhook(request: Request):
 
         usuarios[contact_id] = {
             "estado": "AGUARDANDO_MODO_BUSCA",
-            "cpf": cpf
+            "cpf": cpf,
+            "service_id": usuarios.get(contact_id, {}).get("service_id") or service_id,
+            "numero_contato": usuarios.get(contact_id, {}).get("numero_contato") or numero_contato
         }
 
         enviar_mensagem(
@@ -529,6 +610,8 @@ async def webhook(request: Request):
     if estado == "AGUARDANDO_MODO_BUSCA":
         if mensagem == "1":
             usuarios[contact_id]["estado"] = "AGUARDANDO_NUMERO_PEDIDO"
+            usuarios[contact_id]["service_id"] = usuarios[contact_id].get("service_id") or service_id
+            usuarios[contact_id]["numero_contato"] = usuarios[contact_id].get("numero_contato") or numero_contato
             enviar_mensagem(contact_id, "Digite o número do pedido.")
             return {"status": "ok"}
 
@@ -588,7 +671,9 @@ async def webhook(request: Request):
             usuarios[contact_id] = {
                 "estado": "AGUARDANDO_PEDIDO",
                 "pedidos": pedidos,
-                "mapa_pedidos": mapa
+                "mapa_pedidos": mapa,
+                "service_id": usuarios.get(contact_id, {}).get("service_id") or service_id,
+                "numero_contato": usuarios.get(contact_id, {}).get("numero_contato") or numero_contato
             }
 
             enviar_mensagem(contact_id, texto)
@@ -651,7 +736,9 @@ async def webhook(request: Request):
 
         usuarios[contact_id] = {
             "estado": "AGUARDANDO_BOLETO",
-            "mapa_boletos": mapa_boletos
+            "mapa_boletos": mapa_boletos,
+            "service_id": usuarios.get(contact_id, {}).get("service_id") or service_id,
+            "numero_contato": usuarios.get(contact_id, {}).get("numero_contato") or numero_contato
         }
 
         enviar_mensagem(contact_id, texto)
@@ -682,12 +769,18 @@ async def webhook(request: Request):
 
         usuarios[contact_id]["estado"] = "AGUARDANDO_BOLETO"
         usuarios[contact_id]["mapa_boletos"] = mapa_boletos
+        usuarios[contact_id]["service_id"] = usuarios[contact_id].get("service_id") or service_id
+        usuarios[contact_id]["numero_contato"] = usuarios[contact_id].get("numero_contato") or numero_contato
 
         enviar_mensagem(contact_id, texto)
         return {"status": "ok"}
 
     if estado == "AGUARDANDO_BOLETO":
         mapa = usuarios[contact_id]["mapa_boletos"]
+        numero_contato_estado = usuarios[contact_id].get("numero_contato")
+        service_id_estado = usuarios[contact_id].get("service_id")
+
+        print("DEBUG_AGUARDANDO_BOLETO numero_contato=", numero_contato_estado, "service_id=", service_id_estado)
 
         if mensagem == "todos":
             enviados = 0
@@ -702,15 +795,19 @@ async def webhook(request: Request):
                 nome_arquivo = f"boleto_{boleto.get('id', idx)}.pdf"
 
                 resp_doc = enviar_documento(
-                    contact_id=contact_id,
+                    numero_contato=numero_contato_estado,
+                    service_id=service_id_estado,
                     url_pdf=link,
                     filename=nome_arquivo
                 )
 
-                if resp_doc.status_code in (200, 201):
+                if resp_doc and resp_doc.status_code in (200, 201):
                     enviados += 1
                 else:
-                    print("ERRO_ENVIO_DOCUMENTO:", resp_doc.status_code, resp_doc.text)
+                    if resp_doc is None:
+                        print("ERRO_ENVIO_DOCUMENTO: resposta None")
+                    else:
+                        print("ERRO_ENVIO_DOCUMENTO:", resp_doc.status_code, resp_doc.text)
 
             if enviados == 0:
                 enviar_mensagem(contact_id, "Não consegui enviar os boletos.")
@@ -734,13 +831,17 @@ async def webhook(request: Request):
             nome_arquivo = f"boleto_{boleto.get('id', mensagem)}.pdf"
 
             resp_doc = enviar_documento(
-                contact_id=contact_id,
+                numero_contato=numero_contato_estado,
+                service_id=service_id_estado,
                 url_pdf=link,
                 filename=nome_arquivo
             )
 
-            if resp_doc.status_code not in (200, 201):
-                print("ERRO_ENVIO_DOCUMENTO:", resp_doc.status_code, resp_doc.text)
+            if not resp_doc or resp_doc.status_code not in (200, 201):
+                if resp_doc is None:
+                    print("ERRO_ENVIO_DOCUMENTO: resposta None")
+                else:
+                    print("ERRO_ENVIO_DOCUMENTO:", resp_doc.status_code, resp_doc.text)
                 enviar_mensagem(contact_id, "Não consegui enviar esse boleto.")
                 return {"status": "ok"}
 
@@ -768,3 +869,5 @@ async def webhook(request: Request):
             enviar_mensagem(contact_id, "Digite 1 ou 2.")
 
         return {"status": "ok"}
+
+    return {"status": "ok"}
