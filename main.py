@@ -1,6 +1,10 @@
 from fastapi import FastAPI, Request
 import requests
 import time
+import threading
+import json
+from collections import deque
+from pathlib import Path
 from auth_bling import obter_access_token, forcar_refresh
 from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL, DIGISAC_DEPARTMENT_ID_FINANCEIRO, DIGISAC_USER_ID_FINANCEIRO
 
@@ -12,8 +16,24 @@ mensagens_processadas = set()
 cache_contatos_por_doc = {}
 cache_detalhe_conta = {}
 
-ULTIMA_CHAMADA_BLING = 0.0
-INTERVALO_MINIMO_BLING = 0.4
+# =====================================================
+# LIMITADORES BLING
+# Docs Bling:
+# - 3 requisições por segundo
+# - 120.000 requisições por dia
+# - bloqueio por IP em rajadas/erros excessivos
+# =====================================================
+BLING_MAX_REQ_POR_SEGUNDO = 3
+BLING_JANELA_SEGUNDOS = 1.0
+BLING_MAX_REQ_DIA = 110000  # margem de segurança abaixo dos 120.000 oficiais
+BLING_MAX_ERROS_10S = 250   # margem de segurança abaixo dos 300 erros/10s
+BLING_JANELA_ERROS_SEGUNDOS = 10.0
+BLING_COOLDOWN_ERROS_SEGUNDOS = 30
+BLING_CONTADOR_ARQUIVO = Path("bling_rate_limit.json")
+
+_bling_lock = threading.Lock()
+_bling_requisicoes_1s = deque()
+_bling_erros_10s = deque()
 
 
 # =====================================================
@@ -31,16 +51,75 @@ def formatar_valor(valor):
         return str(valor)
 
 
+def _hoje_str():
+    return time.strftime("%Y-%m-%d")
+
+
+def _ler_contador_bling():
+    if not BLING_CONTADOR_ARQUIVO.exists():
+        return {"data": _hoje_str(), "total": 0}
+
+    try:
+        dados = json.loads(BLING_CONTADOR_ARQUIVO.read_text(encoding="utf-8"))
+    except Exception:
+        return {"data": _hoje_str(), "total": 0}
+
+    if dados.get("data") != _hoje_str():
+        return {"data": _hoje_str(), "total": 0}
+
+    return {"data": dados.get("data", _hoje_str()), "total": int(dados.get("total", 0) or 0)}
+
+
+def _salvar_contador_bling(dados):
+    try:
+        BLING_CONTADOR_ARQUIVO.write_text(json.dumps(dados), encoding="utf-8")
+    except Exception as e:
+        print("ERRO_SALVAR_CONTADOR_BLING:", e)
+
+
 def aguardar_limite_bling():
-    global ULTIMA_CHAMADA_BLING
+    """
+    Controla TODAS as chamadas ao Bling feitas por este processo.
+    Evita passar de 3 req/s e aplica uma trava diária preventiva.
+    """
+    while True:
+        with _bling_lock:
+            agora = time.time()
 
-    agora = time.time()
-    delta = agora - ULTIMA_CHAMADA_BLING
+            while _bling_requisicoes_1s and agora - _bling_requisicoes_1s[0] >= BLING_JANELA_SEGUNDOS:
+                _bling_requisicoes_1s.popleft()
 
-    if delta < INTERVALO_MINIMO_BLING:
-        time.sleep(INTERVALO_MINIMO_BLING - delta)
+            dados_dia = _ler_contador_bling()
+            if dados_dia["total"] >= BLING_MAX_REQ_DIA:
+                raise RuntimeError("Limite diário preventivo do Bling atingido. Interrompendo para evitar bloqueio.")
 
-    ULTIMA_CHAMADA_BLING = time.time()
+            if len(_bling_requisicoes_1s) < BLING_MAX_REQ_POR_SEGUNDO:
+                _bling_requisicoes_1s.append(agora)
+                dados_dia["total"] += 1
+                _salvar_contador_bling(dados_dia)
+                return
+
+            esperar = BLING_JANELA_SEGUNDOS - (agora - _bling_requisicoes_1s[0]) + 0.05
+
+        time.sleep(max(esperar, 0.05))
+
+
+def registrar_erro_bling(status_code):
+    if status_code < 400:
+        return
+
+    with _bling_lock:
+        agora = time.time()
+        _bling_erros_10s.append(agora)
+
+        while _bling_erros_10s and agora - _bling_erros_10s[0] >= BLING_JANELA_ERROS_SEGUNDOS:
+            _bling_erros_10s.popleft()
+
+        qtd_erros = len(_bling_erros_10s)
+
+    if qtd_erros >= BLING_MAX_ERROS_10S:
+        print(f"MUITOS_ERROS_BLING: {qtd_erros} erros em 10s. Pausando {BLING_COOLDOWN_ERROS_SEGUNDOS}s para evitar bloqueio de IP.")
+        time.sleep(BLING_COOLDOWN_ERROS_SEGUNDOS)
 
 
 def extrair_numero_contato_webhook(data):
@@ -164,8 +243,17 @@ def perguntar_continuar_atendimento(contact_id):
 # BLING
 # =====================================================
 
-def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2, retry_on_5xx=2):
-    aguardar_limite_bling()
+def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=5, retry_on_5xx=3):
+    try:
+        aguardar_limite_bling()
+    except RuntimeError as e:
+        print("BLOQUEIO_PREVENTIVO_BLING:", e)
+        class RespFake:
+            status_code = 429
+            text = str(e)
+            def json(self):
+                return {"error": {"message": str(e)}}
+        return RespFake()
 
     token = obter_access_token()
 
@@ -175,9 +263,12 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2, retry_on
 
     url = f"{BLING_BASE_URL}{endpoint}"
     resp = requests.get(url, headers=headers, params=params, timeout=30)
+    registrar_erro_bling(resp.status_code)
 
     if resp.status_code == 401 and retry_on_401:
         print("Token expirado. Renovando...")
+        # IMPORTANTE: o endpoint /oauth/token também tem limite próprio no Bling.
+        # Evite forçar refresh repetidamente fora daqui.
         forcar_refresh()
         return bling_get(
             endpoint,
@@ -188,8 +279,18 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2, retry_on
         )
 
     if resp.status_code == 429 and retry_on_429 > 0:
-        print("Rate limit Bling. Aguardando 1s...")
-        time.sleep(1)
+        retry_after = resp.headers.get("Retry-After")
+        try:
+            espera = float(retry_after) if retry_after else None
+        except Exception:
+            espera = None
+
+        if espera is None:
+            tentativa = 6 - retry_on_429
+            espera = min(2 ** tentativa, 30)
+
+        print(f"Rate limit Bling 429. Aguardando {espera}s antes de tentar novamente...")
+        time.sleep(espera)
         return bling_get(
             endpoint,
             params=params,
@@ -199,8 +300,10 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=2, retry_on
         )
 
     if resp.status_code in (502, 503, 504) and retry_on_5xx > 0:
-        print(f"Erro {resp.status_code} no Bling. Aguardando 2s para tentar novamente...")
-        time.sleep(2)
+        tentativa = 4 - retry_on_5xx
+        espera = min(2 ** tentativa, 20)
+        print(f"Erro {resp.status_code} no Bling. Aguardando {espera}s para tentar novamente...")
+        time.sleep(espera)
         return bling_get(
             endpoint,
             params=params,
