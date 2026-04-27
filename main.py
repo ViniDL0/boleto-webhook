@@ -16,17 +16,10 @@ mensagens_processadas = set()
 cache_contatos_por_doc = {}
 cache_detalhe_conta = {}
 
-# =====================================================
-# LIMITADORES BLING
-# Docs Bling:
-# - 3 requisições por segundo
-# - 120.000 requisições por dia
-# - bloqueio por IP em rajadas/erros excessivos
-# =====================================================
 BLING_MAX_REQ_POR_SEGUNDO = 3
 BLING_JANELA_SEGUNDOS = 1.0
-BLING_MAX_REQ_DIA = 110000  # margem de segurança abaixo dos 120.000 oficiais
-BLING_MAX_ERROS_10S = 250   # margem de segurança abaixo dos 300 erros/10s
+BLING_MAX_REQ_DIA = 110000
+BLING_MAX_ERROS_10S = 250
 BLING_JANELA_ERROS_SEGUNDOS = 10.0
 BLING_COOLDOWN_ERROS_SEGUNDOS = 30
 BLING_CONTADOR_ARQUIVO = Path("bling_rate_limit.json")
@@ -78,10 +71,6 @@ def _salvar_contador_bling(dados):
 
 
 def aguardar_limite_bling():
-    """
-    Controla TODAS as chamadas ao Bling feitas por este processo.
-    Evita passar de 3 req/s e aplica uma trava diária preventiva.
-    """
     while True:
         with _bling_lock:
             agora = time.time()
@@ -123,10 +112,6 @@ def registrar_erro_bling(status_code):
 
 
 def extrair_numero_contato_webhook(data):
-    """
-    Tenta descobrir o número do contato a partir do webhook.
-    Se não encontrar, faz fallback para fromId/contactId.
-    """
     candidatos = [
         data.get("number"),
         data.get("fromNumber"),
@@ -267,8 +252,6 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=5, retry_on
 
     if resp.status_code == 401 and retry_on_401:
         print("Token expirado. Renovando...")
-        # IMPORTANTE: o endpoint /oauth/token também tem limite próprio no Bling.
-        # Evite forçar refresh repetidamente fora daqui.
         forcar_refresh()
         return bling_get(
             endpoint,
