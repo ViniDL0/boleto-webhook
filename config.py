@@ -20,7 +20,7 @@ load_dotenv(caminho(".env"))
 
 CLIENT_ID = os.getenv("BLING_CLIENT_ID")
 CLIENT_SECRET = os.getenv("BLING_CLIENT_SECRET")
-REDIRECT_URI = os.getenv("BLING_REDIRECT_URI", "http://localhost:8080/callback")
+REDIRECT_URI = os.getenv("BLING_REDIRECT_URI", "https://intranetsdamed.elementfx.com/botdigisac/callback")
 
 # Tokens iniciais vindos do .env/Railway.
 # Depois da primeira renovação, o token novo será salvo em bling_token.json.
