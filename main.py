@@ -243,7 +243,8 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=5, retry_on
     token = obter_access_token()
 
     headers = {
-        "Authorization": f"Bearer {token}"
+        "Authorization": f"Bearer {token}",
+        "enable-jwt": "1"
     }
 
     url = f"{BLING_BASE_URL}{endpoint}"

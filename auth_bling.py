@@ -73,6 +73,9 @@ def renovar_token(refresh_token):
     response = requests.post(
         TOKEN_URL,
         auth=(CLIENT_ID, CLIENT_SECRET),
+        headers={
+            "enable-jwt": "1"
+        },
         data={
             "grant_type": "refresh_token",
             "refresh_token": refresh_token,
