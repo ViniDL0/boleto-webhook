@@ -244,6 +244,7 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=5, retry_on
 
     headers = {
         "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
         "enable-jwt": "1"
     }
 
