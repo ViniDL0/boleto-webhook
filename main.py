@@ -1,6 +1,4 @@
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
-import base64
 import requests
 import time
 import threading
@@ -8,7 +6,7 @@ import json
 from collections import deque
 from pathlib import Path
 from auth_bling import obter_access_token, forcar_refresh
-from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL, DIGISAC_DEPARTMENT_ID_FINANCEIRO, DIGISAC_USER_ID_FINANCEIRO, CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, AUTH_URL, TOKEN_URL
+from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL, DIGISAC_DEPARTMENT_ID_FINANCEIRO, DIGISAC_USER_ID_FINANCEIRO
 
 app = FastAPI()
 
@@ -618,60 +616,6 @@ def agrupar_boletos_por_pedido(lista):
 @app.get("/")
 def home():
     return {"status": "online"}
-
-
-@app.get("/login")
-def login_bling():
-    url = (
-        f"{AUTH_URL}"
-        f"?response_type=code"
-        f"&client_id={CLIENT_ID}"
-        f"&redirect_uri={REDIRECT_URI}"
-    )
-    return RedirectResponse(url)
-
-
-@app.get("/callback")
-def callback_bling(code: str):
-    credenciais = f"{CLIENT_ID}:{CLIENT_SECRET}"
-    basic = base64.b64encode(credenciais.encode()).decode()
-
-    headers = {
-        "Authorization": f"Basic {basic}",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "1.0",
-        "enable-jwt": "1",
-    }
-
-    data = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": REDIRECT_URI,
-    }
-
-    resp = requests.post(TOKEN_URL, headers=headers, data=data, timeout=30)
-
-    print("GERAR_TOKEN_BLING:", resp.status_code, resp.text[:1000])
-
-    if resp.status_code != 200:
-        return {
-            "ok": False,
-            "status": resp.status_code,
-            "erro": resp.text
-        }
-
-    token = resp.json()
-
-    with open("bling_token.json", "w", encoding="utf-8") as f:
-        json.dump(token, f, indent=4, ensure_ascii=False)
-
-    return {
-        "ok": True,
-        "mensagem": "Tokens gerados e salvos em bling_token.json",
-        "access_token": token.get("access_token"),
-        "refresh_token": token.get("refresh_token")
-    }
-
 
 @app.post("/webhook/digisac")
 async def webhook(request: Request):
