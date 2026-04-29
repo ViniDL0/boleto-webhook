@@ -3,12 +3,37 @@ import requests
 import time
 import threading
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 from collections import deque
 from pathlib import Path
 from auth_bling import obter_access_token, forcar_refresh
 from config import DIGISAC_TOKEN, DIGISAC_BASE_URL, BLING_BASE_URL, DIGISAC_DEPARTMENT_ID_FINANCEIRO, DIGISAC_USER_ID_FINANCEIRO
 
-app = FastAPI()
+logger = logging.getLogger("botdigisac")
+logger.setLevel(logging.INFO)
+
+handler = RotatingFileHandler(
+    "botdigisac.log",
+    maxBytes=2_000_000,
+    backupCount=5,
+    encoding="utf-8"
+)
+
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s"
+)
+
+handler.setFormatter(formatter)
+
+if not logger.handlers:
+    logger.addHandler(handler)
+
+app = FastAPI(
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None
+)
 
 usuarios = {}
 mensagens_processadas = set()
@@ -67,7 +92,7 @@ def _salvar_contador_bling(dados):
     try:
         BLING_CONTADOR_ARQUIVO.write_text(json.dumps(dados), encoding="utf-8")
     except Exception as e:
-        print("ERRO_SALVAR_CONTADOR_BLING:", e)
+        logger.error(f"ERRO_SALVAR_CONTADOR_BLING: {e}")
 
 
 def aguardar_limite_bling():
@@ -107,7 +132,7 @@ def registrar_erro_bling(status_code):
         qtd_erros = len(_bling_erros_10s)
 
     if qtd_erros >= BLING_MAX_ERROS_10S:
-        print(f"MUITOS_ERROS_BLING: {qtd_erros} erros em 10s. Pausando {BLING_COOLDOWN_ERROS_SEGUNDOS}s para evitar bloqueio de IP.")
+        logger.warning(f"MUITOS_ERROS_BLING: {qtd_erros} erros em 10s. Pausando {BLING_COOLDOWN_ERROS_SEGUNDOS}s.")
         time.sleep(BLING_COOLDOWN_ERROS_SEGUNDOS)
 
 
@@ -153,7 +178,7 @@ def enviar_mensagem(contact_id, texto):
     }
 
     resp = requests.post(url, json=body, headers=headers, timeout=30)
-    print("Digisac mensagem:", resp.status_code, resp.text)
+    logger.info(f"Digisac mensagem: {resp.status_code} | {resp.text}")
     return resp
 
 def fechar_chamado(contact_id):
@@ -166,7 +191,7 @@ def fechar_chamado(contact_id):
 
     resp = requests.post(url, headers=headers, timeout=30)
 
-    print("Digisac fechar chamado:", resp.status_code, resp.text)
+    logger.info(f"Digisac fechar chamado: {resp.status_code} | {resp.text}")
     return resp
 
 
@@ -188,8 +213,8 @@ def transferir_chamado(contact_id, department_id, user_id="", comments="Transfer
 
     resp = requests.post(url, json=body, headers=headers, timeout=30)
 
-    print("DIGISAC_TRANSFERENCIA_PAYLOAD:", body)
-    print("Digisac transferência:", resp.status_code, resp.text)
+    logger.info(f"DIGISAC_TRANSFERENCIA_PAYLOAD: {body}")
+    logger.info(f"Digisac transferência: {resp.status_code} | {resp.text}")
 
     return resp
 
@@ -232,7 +257,7 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=5, retry_on
     try:
         aguardar_limite_bling()
     except RuntimeError as e:
-        print("BLOQUEIO_PREVENTIVO_BLING:", e)
+        logger.warning(f"BLOQUEIO_PREVENTIVO_BLING: {e}")
         class RespFake:
             status_code = 429
             text = str(e)
@@ -253,7 +278,7 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=5, retry_on
     registrar_erro_bling(resp.status_code)
 
     if resp.status_code == 401 and retry_on_401:
-        print("Token expirado. Renovando...")
+        logger.warning("Token expirado. Renovando...")
         forcar_refresh()
         return bling_get(
             endpoint,
@@ -274,7 +299,7 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=5, retry_on
             tentativa = 6 - retry_on_429
             espera = min(2 ** tentativa, 30)
 
-        print(f"Rate limit Bling 429. Aguardando {espera}s antes de tentar novamente...")
+        logger.warning(f"Rate limit Bling 429. Aguardando {espera}s antes de tentar novamente...")
         time.sleep(espera)
         return bling_get(
             endpoint,
@@ -287,7 +312,7 @@ def bling_get(endpoint, params=None, retry_on_401=True, retry_on_429=5, retry_on
     if resp.status_code in (502, 503, 504) and retry_on_5xx > 0:
         tentativa = 4 - retry_on_5xx
         espera = min(2 ** tentativa, 20)
-        print(f"Erro {resp.status_code} no Bling. Aguardando {espera}s para tentar novamente...")
+        logger.warning(f"Erro {resp.status_code} no Bling. Aguardando {espera}s para tentar novamente...")
         time.sleep(espera)
         return bling_get(
             endpoint,
@@ -305,10 +330,10 @@ def buscar_detalhe_conta(id_conta):
         return cache_detalhe_conta[id_conta]
 
     resp = bling_get(f"/contas/receber/{id_conta}")
-    print("DETALHE_CONTA_STATUS:", id_conta, resp.status_code)
+    logger.info(f"DETALHE_CONTA_STATUS: {id_conta} | {resp.status_code}")
 
     if resp.status_code != 200:
-        print("Erro detalhe conta:", resp.text)
+        logger.error(f"Erro detalhe conta: {resp.text}")
         return None
 
     data = resp.json().get("data", {})
@@ -387,10 +412,10 @@ def buscar_contato_por_documento(cpf_cnpj):
         }
 
         resp = bling_get("/contatos", params=params)
-        print("Bling contatos:", resp.status_code, "pagina", pagina)
+        logger.info(f"Bling contatos: {resp.status_code} | pagina {pagina}")
 
         if resp.status_code != 200:
-            print("Erro contatos:", resp.text)
+            logger.error(f"Erro contatos: {resp.text}")
             return {"ok": False, "erro": "falha_consulta"}
 
         data = resp.json().get("data", [])
@@ -429,10 +454,10 @@ def buscar_contas_por_contato_id(contato_id):
         }
 
         resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber por contato:", resp.status_code, "pagina", pagina)
+        logger.info(f"Bling contas/receber por contato: {resp.status_code} | pagina {pagina}")
 
         if resp.status_code != 200:
-            print("Erro contas por contato:", resp.text)
+            logger.error(f"Erro contas por contato: {resp.text}")
             return {"ok": False, "erro": "falha_consulta"}
 
         dados = resp.json().get("data", [])
@@ -462,10 +487,10 @@ def buscar_contas_por_documento(cpf_cnpj):
         }
 
         resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber geral:", resp.status_code, "pagina", pagina)
+        logger.info(f"Bling contas/receber geral: {resp.status_code} | pagina {pagina}")
 
         if resp.status_code != 200:
-            print("Erro contas geral:", resp.text)
+            logger.error(f"Erro contas geral: {resp.text}")
             return {"ok": False, "erro": "falha_consulta"}
 
         dados = resp.json().get("data", [])
@@ -500,10 +525,10 @@ def buscar_contas_por_numero_pedido(numero_pedido):
         }
 
         resp = bling_get("/contas/receber", params=params)
-        print("Bling contas/receber por pedido:", resp.status_code, "pagina", pagina)
+        logger.info(f"Bling contas/receber por pedido: {resp.status_code} | pagina {pagina}")
 
         if resp.status_code != 200:
-            print("Erro contas por pedido:", resp.text)
+            logger.error(f"Erro contas por pedido: {resp.text}")
             return {"ok": False, "erro": "falha_consulta"}
 
         dados = resp.json().get("data", [])
@@ -516,18 +541,16 @@ def buscar_contas_por_numero_pedido(numero_pedido):
             pedido = str(origem.get("numero", "")).strip()
 
             if pedido:
-                print(
-                    "PEDIDO_ENCONTRADO_NA_VARREDURA:",
-                    "pagina=", pagina,
-                    "conta_id=", conta.get("id"),
-                    "pedido=", pedido,
-                    "contato_id=", (conta.get("contato") or {}).get("id"),
-                    "documento=", (conta.get("contato") or {}).get("numeroDocumento"),
-                    "situacao=", conta.get("situacao")
-                )
+                logger.info(
+                        f"PEDIDO_ENCONTRADO_NA_VARREDURA: pagina={pagina} "
+                        f"conta_id={conta.get('id')} pedido={pedido} "
+                        f"contato_id={(conta.get('contato') or {}).get('id')} "
+                        f"documento={(conta.get('contato') or {}).get('numeroDocumento')} "
+                        f"situacao={conta.get('situacao')}"
+                    )
 
             if pedido == numero_pedido:
-                print("MATCH_PEDIDO:", conta)
+                logger.info(f"MATCH_PEDIDO: {conta}")
                 contas.append(conta)
 
         if len(dados) < 100:
@@ -546,15 +569,13 @@ def filtrar_boletos(contas, numero_pedido=None):
         detalhe = buscar_detalhe_conta(conta.get("id"))
         pedido = extrair_numero_pedido(conta)
 
-        print(
-            "FILTRO_CONTA:",
-            conta.get("id"),
-            "pedido=", pedido,
-            "situacao=", conta.get("situacao"),
-            "linkBoleto=", (detalhe or {}).get("linkBoleto", ""),
-            "saldo=", (detalhe or {}).get("saldo", ""),
-            "historico=", (detalhe or {}).get("historico", "")
-        )
+        logger.info(
+                f"FILTRO_CONTA: {conta.get('id')} "
+                f"pedido={pedido} situacao={conta.get('situacao')} "
+                f"linkBoleto={(detalhe or {}).get('linkBoleto', '')} "
+                f"saldo={(detalhe or {}).get('saldo', '')} "
+                f"historico={(detalhe or {}).get('historico', '')}"
+            )
 
         if numero_pedido and pedido != numero_pedido:
             continue
@@ -577,25 +598,17 @@ def filtrar_boletos(contas, numero_pedido=None):
 
 def buscar_boletos_completo(contato_id, cpf_cnpj, numero_pedido=None):
     resp1 = buscar_contas_por_contato_id(contato_id)
+
     if not resp1["ok"]:
         return {"ok": False, "erro": "falha_consulta"}
 
-    resp2 = buscar_contas_por_documento(cpf_cnpj)
-    if not resp2["ok"]:
-        return {"ok": False, "erro": "falha_consulta"}
-
-    contas = resp1["contas"] + resp2["contas"]
-
-    if numero_pedido:
-        resp3 = buscar_contas_por_numero_pedido(numero_pedido)
-        if not resp3["ok"]:
-            return {"ok": False, "erro": "falha_consulta"}
-        contas += resp3["contas"]
+    contas = resp1["contas"]
 
     contas = deduplicar_contas(contas)
-    print("TOTAL_CONTAS_COMBINADAS:", len(contas))
+    logger.info(f"TOTAL_CONTAS_POR_CONTATO: {len(contas)}")
 
     boletos = filtrar_boletos(contas, numero_pedido=numero_pedido)
+
     return {"ok": True, "boletos": boletos}
 
 
@@ -620,7 +633,7 @@ def home():
 @app.post("/webhook/digisac")
 async def webhook(request: Request):
     body = await request.json()
-    print("Webhook recebido:", body)
+    logger.info(f"Webhook recebido: {body}")
 
     data = body.get("data", {})
 
@@ -708,7 +721,7 @@ async def webhook(request: Request):
         enviar_mensagem(contact_id, "Consultando cadastro... 🔍")
 
         resp_contato = buscar_contato_por_documento(cpf)
-        print("RESPOSTA_CONTATO_DEBUG:", resp_contato)
+        logger.info(f"RESPOSTA_CONTATO_DEBUG: {resp_contato}")
 
         if not resp_contato["ok"]:
             enviar_mensagem(contact_id, "Estou com instabilidade na consulta agora.")
@@ -732,15 +745,13 @@ async def webhook(request: Request):
 
         enviar_mensagem(contact_id, "Buscando seus boletos... 🔍")
 
-        print(
-            "CONTATO_ENCONTRADO_ID:",
-            contato.get("id"),
-            contato.get("nome"),
-            contato.get("numeroDocumento")
+        logger.info(
+            f"CONTATO_ENCONTRADO_ID: {contato.get('id')} | "
+            f"{contato.get('nome')} | {contato.get('numeroDocumento')}"
         )
 
         resp_boletos = buscar_boletos_completo(contato["id"], cpf)
-        print("RESPOSTA_BOLETOS_DEBUG:", resp_boletos)
+        logger.info(f"RESPOSTA_BOLETOS_DEBUG: {resp_boletos}")
 
         if not resp_boletos["ok"]:
             enviar_mensagem(contact_id, "Erro ao consultar boletos.")
@@ -791,7 +802,7 @@ async def webhook(request: Request):
                 link = buscar_link_boleto_do_item(boleto)
 
                 if not link:
-                    print(f"BOLETO_SEM_LINK: opcao={idx} id={boleto.get('id')}")
+                    logger.warning(f"BOLETO_SEM_LINK: opcao={idx} id={boleto.get('id')}")
                     continue
 
                 resp_link = enviar_link_boleto(contact_id, link, boleto=boleto)
@@ -800,9 +811,9 @@ async def webhook(request: Request):
                     enviados += 1
                 else:
                     if resp_link is None:
-                        print("ERRO_ENVIO_LINK: resposta None")
+                        logger.error("ERRO_ENVIO_LINK: resposta None")
                     else:
-                        print("ERRO_ENVIO_LINK:", resp_link.status_code, resp_link.text)
+                        logger.error(f"ERRO_ENVIO_LINK: {resp_link.status_code} | {resp_link.text}")
 
             if enviados == 0:
                 enviar_mensagem(contact_id, "Não consegui enviar os boletos.")
@@ -827,9 +838,9 @@ async def webhook(request: Request):
 
             if not resp_link or resp_link.status_code not in (200, 201):
                 if resp_link is None:
-                    print("ERRO_ENVIO_LINK: resposta None")
+                    logger.error("ERRO_ENVIO_LINK: resposta None")
                 else:
-                    print("ERRO_ENVIO_LINK:", resp_link.status_code, resp_link.text)
+                    logger.error(f"ERRO_ENVIO_LINK: {resp_link.status_code} | {resp_link.text}")
                 enviar_mensagem(contact_id, "Não consegui enviar o link desse boleto.")
                 return {"status": "ok"}
 
